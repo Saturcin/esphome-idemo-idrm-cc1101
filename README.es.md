@@ -1,5 +1,7 @@
 # Gateway ESPHome para Idemo IDRM (ESP32 + CC1101)
 
+[English](README.md) | [Español](README.es.md)
+
 Proyecto comunitario para controlar **motores de persiana Idemo IDRM de 433,92 MHz** desde **Home Assistant** usando **ESPHome, un ESP32 y un CC1101**.
 
 > **Estado:** experimental / probado por la comunidad.  

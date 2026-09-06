@@ -100,6 +100,10 @@ remote_transmitter:
   on_transmit:
     then:
       - cc1101.begin_tx
+
+  on_complete:
+    then:
+      - cc1101.set_idle
 # ============================================================
 # TRANSMISIÓN RF IDEMO IDRM
 # ============================================================

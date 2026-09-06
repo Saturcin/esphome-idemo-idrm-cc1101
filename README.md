@@ -1,5 +1,7 @@
 # ESPHome Idemo IDRM Gateway (ESP32 + CC1101)
 
+[English](README.md) | [Español](README.es.md)
+
 Community project to control **Idemo IDRM 433.92 MHz roller shutter motors** from **Home Assistant** using **ESPHome, an ESP32 and a CC1101 radio module**.
 
 > **Status:** experimental / community-tested.  
@@ -53,7 +55,7 @@ See [docs/WIRING.md](docs/WIRING.md).
 - An ESP32 supported by ESPHome.
 - Current ESPHome CC1101 and Remote Transmitter components.
 
-ESPHome currently includes a CC1101 component and supports asynchronous operation with the Remote Transmitter component:
+ESPHome includes native CC1101 support and integration with the Remote Transmitter component:
 
 - https://esphome.io/components/cc1101/
 - https://esphome.io/components/remote_transmitter/

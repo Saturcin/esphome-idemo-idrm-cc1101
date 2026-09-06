@@ -34,6 +34,14 @@ remote_transmitter:
   pin: GPIO32
   carrier_duty_percent: 100%
   non_blocking: false
+
+  on_transmit:
+    then:
+      - cc1101.begin_tx
+
+  on_complete:
+    then:
+      - cc1101.set_idle
 ```
 
 ## Power warning
