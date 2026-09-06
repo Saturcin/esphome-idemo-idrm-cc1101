@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Added built-in RF sniffer on CC1101 GDO2 / ESP32 GPIO33 with human-readable IDRM frame logging.
+- Return CC1101 to RX mode after each gateway transmission so sniffing remains active.
 - Exposed the four IDRM transmitter-ID bytes as YAML `substitutions`.
 - Documented that the ID should currently come from a legitimate paired remote capture.
 - Documented failed arbitrary-ID pairing experiments and current rolling-code/check-byte uncertainty.

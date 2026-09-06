@@ -11,7 +11,7 @@
 | MISO | GPIO19 | SPI MISO |
 | CSN / CS | GPIO5 | Chip select |
 | GDO0 | GPIO32 | Asynchronous RF TX data |
-| GDO2 | Not connected | Receiver/sniffer removed |
+| GDO2 | GPIO33 | Asynchronous RF RX data / built-in sniffer |
 
 YAML:
 
@@ -29,6 +29,13 @@ cc1101:
   filter_bandwidth: 203kHz
   output_power: 10
 
+remote_receiver:
+  id: idrm_rx
+  pin: GPIO33
+  tolerance: 30%
+  filter: 50us
+  idle: 4ms
+
 remote_transmitter:
   id: idrm_tx
   pin: GPIO32
@@ -41,7 +48,7 @@ remote_transmitter:
 
   on_complete:
     then:
-      - cc1101.set_idle
+      - cc1101.begin_rx
 ```
 
 ## Power warning
@@ -55,3 +62,7 @@ Use a CC1101 module intended for the 433 MHz band and an appropriate antenna. Ra
 ## Mains warning
 
 The gateway itself is low voltage. The shutter motor may be powered from mains voltage. This repository does not provide mains wiring instructions.
+
+## Built-in sniffer
+
+The public YAML uses the recommended CC1101 dual-pin arrangement: GDO0 for TX and GDO2 for RX. The custom `on_raw` decoder prints recognised IDRM frames as `IDRM SNIFFER` lines. If GDO2 is not connected, transmission can still work but the sniffer cannot receive the original remote.

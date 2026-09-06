@@ -56,9 +56,11 @@ Use the normal ESPHome installation workflow.
 
 After the node is online, Home Assistant should discover the ESPHome device. Add it and check that the six cover entities and calibration/time entities are available.
 
-## 8. Transmitter identity
+## 8. Transmitter identity and built-in sniffer
 
-At the current project stage, use the four ID bytes captured from a legitimate IDRM remote already paired to the motor. Arbitrary-ID pairing has been tested and did not work. See `PAIRING_AND_ID.md`.
+Connect CC1101 `GDO2` to ESP32 `GPIO33`, open the ESPHome logs and press UP/STOP/DOWN on the legitimate original remote. Search for `IDRM SNIFFER` lines and use the four bytes shown after `ID=` for `idrm_id_1` ... `idrm_id_4`.
+
+Arbitrary-ID pairing has been tested and did not work. Save complete 8-byte frame captures because the check-byte behaviour with other legitimate IDs is still under investigation. See `PAIRING_AND_ID.md`.
 
 ## 9. Establish a known position
 

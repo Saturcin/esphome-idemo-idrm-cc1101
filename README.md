@@ -22,7 +22,7 @@ Current features:
 - Editable **direction-dependent calibration curves** from Home Assistant.
 - Direct mathematical positioning without first travelling to an end stop.
 - Special channel-6 STOP/RELEASE behaviour found during RF reverse engineering.
-- No RF sniffer enabled in the normal configuration.
+- Built-in IDRM RF sniffer with human-readable frame logging for discovering the original remote ID.
 
 ## Hardware
 
@@ -42,7 +42,7 @@ Current features:
 | MISO | GPIO19 |
 | CSN / CS | GPIO5 |
 | GDO0 | GPIO32 |
-| GDO2 | Not used |
+| GDO2 | GPIO33 (RX/sniffer) |
 
 **Never power the CC1101 from 5 V.**
 
@@ -53,12 +53,13 @@ See [docs/WIRING.md](docs/WIRING.md).
 - Home Assistant.
 - ESPHome.
 - An ESP32 supported by ESPHome.
-- Current ESPHome CC1101 and Remote Transmitter components.
+- Current ESPHome CC1101, Remote Transmitter and Remote Receiver components.
 
-ESPHome includes native CC1101 support and integration with the Remote Transmitter component:
+ESPHome includes native CC1101 support and integration with the Remote Transmitter/Receiver components:
 
 - https://esphome.io/components/cc1101/
 - https://esphome.io/components/remote_transmitter/
+- https://esphome.io/components/remote_receiver/
 - https://esphome.io/components/cover/template/
 
 ## Installation
@@ -69,13 +70,14 @@ ESPHome includes native CC1101 support and integration with the Remote Transmitt
    wifi_ssid: "YOUR_WIFI_SSID"
    wifi_password: "YOUR_WIFI_PASSWORD"
    ```
-3. Review the transmitter ID, channel configuration, travel times and calibration values before flashing.
-4. Validate the YAML in ESPHome.
-5. Flash the ESP32.
-6. Add the ESPHome device to Home Assistant.
-7. Enter the four transmitter-ID bytes captured from a legitimate paired IDRM remote.
-8. Fully open or fully close each shutter once to establish a known physical reference.
-9. Fine-tune travel times and calibration curves from Home Assistant.
+3. Wire `CC1101 GDO2 -> ESP32 GPIO33` if you want to use the built-in sniffer.
+4. Validate and flash the YAML.
+5. Open ESPHome logs and press UP/STOP/DOWN on the legitimate original remote.
+6. Look for `IDRM SNIFFER` lines. The **first four bytes** after `FRAME=` are the transmitter ID.
+7. Put those four bytes into `idrm_id_1` ... `idrm_id_4`, validate and flash again.
+8. Add the ESPHome device to Home Assistant.
+9. Fully open or fully close each shutter once to establish a known physical reference.
+10. Fine-tune travel times and calibration curves from Home Assistant.
 
 See [docs/INSTALLATION.md](docs/INSTALLATION.md) and [docs/CALIBRATION.md](docs/CALIBRATION.md).
 
@@ -100,6 +102,16 @@ We experimentally tested whether an arbitrary new ID could be paired as a new tr
 > **Checksum caveat:** the command/check-byte logic in this repository has been fully validated only with the development ID `46 84 5D 9C`. Captures from additional legitimate transmitter IDs are needed to confirm how the check byte generalises.
 
 See [docs/PAIRING_AND_ID.md](docs/PAIRING_AND_ID.md).
+
+### Built-in sniffer log
+
+With `GDO2` connected to `GPIO33`, the same YAML listens for the raw IDRM pulse shape and prints recognised 64-bit frames in a compact form:
+
+```text
+IDRM SNIFFER | FRAME=46 84 5D 9C 02 00 16 95 | ID=46 84 5D 9C | CH=02 00 | CMD=16 (UP) | CHECK=95
+```
+
+For configuration, note the four bytes after `ID=`. Also save complete UP/STOP/DOWN frame lines: captures from additional legitimate remotes are valuable because the check-byte/rolling-code behaviour for other transmitter identities is not yet fully understood.
 
 ## Default channels
 

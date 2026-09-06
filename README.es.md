@@ -86,6 +86,16 @@ Hemos probado experimentalmente a generar un ID arbitrario nuevo y emparejarlo c
 
 Consulta [docs/PAIRING_AND_ID.md](docs/PAIRING_AND_ID.md).
 
+### Sniffer integrado
+
+Con `GDO2` conectado a `GPIO33`, el mismo YAML escucha el formato de pulsos IDRM y muestra en el log las tramas reconocidas de forma legible:
+
+```text
+IDRM SNIFFER | FRAME=46 84 5D 9C 02 00 16 95 | ID=46 84 5D 9C | CH=02 00 | CMD=16 (UP) | CHECK=95
+```
+
+Para configurar el ID, hay que apuntar los cuatro bytes que aparecen después de `ID=`. También conviene guardar las líneas completas de UP/STOP/DOWN, porque el comportamiento del byte final/rolling code con otras identidades de emisor aún necesita validación.
+
 ## Canales
 
 | Canal | Bytes IDRM |

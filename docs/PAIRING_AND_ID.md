@@ -26,13 +26,33 @@ This value came from a legitimate physical IDRM remote used during reverse engin
 
 At the current stage of the project, the recommended approach is:
 
-1. Capture a transmission from a legitimate IDRM remote that is already paired with the target motor.
-2. Decode/identify the first four transmitter-ID bytes.
-3. Put those four bytes into the YAML substitutions.
-4. Validate and flash the gateway.
-5. Test with a single channel before deploying all channels.
+1. Connect CC1101 `GDO2` to ESP32 `GPIO33`.
+2. Flash the public YAML and open the ESPHome logs.
+3. Press UP, STOP and DOWN on a legitimate IDRM remote already paired to the target motor (2-3 presses each is recommended).
+4. Look for `IDRM SNIFFER` log lines.
+5. The first four bytes shown after `ID=` are the transmitter-ID bytes.
+6. Put those four bytes into the YAML substitutions.
+7. Save the complete 8-byte UP/STOP/DOWN frame lines for troubleshooting/community validation.
+8. Validate, flash and test with a single channel before deploying all channels.
 
-The normal runtime YAML intentionally has no RF receiver/sniffer enabled.
+The public YAML now includes the receiver/sniffer. It returns the CC1101 to RX mode after gateway transmissions, so listening remains available during normal operation.
+
+## What to look for in the log
+
+Example:
+
+```text
+IDRM SNIFFER | FRAME=46 84 5D 9C 02 00 16 95 | ID=46 84 5D 9C | CH=02 00 | CMD=16 (UP) | CHECK=95
+```
+
+Interpretation used by this project:
+
+- bytes 1-4: transmitter identity;
+- bytes 5-6: channel;
+- byte 7: command;
+- byte 8: observed check/CRC byte.
+
+For the YAML substitutions, use bytes 1-4. Keep the complete frame captures because only the development identity has been fully characterised so far.
 
 ## Why not generate a random ID?
 

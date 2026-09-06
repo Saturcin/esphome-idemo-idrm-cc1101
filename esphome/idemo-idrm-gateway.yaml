@@ -56,6 +56,27 @@ substitutions:
   # Replace these 4 bytes with the transmitter identity
   # captured from a legitimate IDRM remote paired to your motor.
   #
+  # HOW TO FIND THE ID WITH THE BUILT-IN SNIFFER:
+  # 1. Wire CC1101 GDO2 -> ESP32 GPIO33.
+  # 2. Flash this YAML and open the ESPHome logs.
+  # 3. Press UP on the ORIGINAL paired remote 2-3 times.
+  # 4. Search the log for a line beginning with:
+  #      IDRM SNIFFER | FRAME=...
+  # 5. Example:
+  #      IDRM SNIFFER | FRAME=46 84 5D 9C 02 00 16 95
+  #                    | ID=46 84 5D 9C | CH=02 00
+  #                    | CMD=16 (UP) | CHECK=95
+  # 6. THE FIRST FOUR BYTES are the transmitter ID:
+  #      46 84 5D 9C
+  # 7. Put those four bytes in idrm_id_1 ... idrm_id_4 below.
+  #
+  # RECOMMENDED CAPTURE:
+  # - Press UP, STOP and DOWN 2-3 times each.
+  # - Repeated frames from one press are normal.
+  # - Save the complete 8-byte lines, not only the ID. They are
+  #   useful because the check-byte behaviour for other IDs is
+  #   not yet fully understood.
+  #
   # Development/test ID:
   #   46 84 5D 9C
   #
@@ -110,6 +131,161 @@ cc1101:
   filter_bandwidth: 203kHz
   output_power: 10
 
+# ============================================================
+# SNIFFER RF IDRM INTEGRADO
+#
+# Cable adicional necesario para escuchar el mando original:
+#   CC1101 GDO2 -> ESP32 GPIO33
+#
+# El sniffer NO modifica las tramas recibidas y NO empareja nada.
+# Solo escucha 433.92 MHz y, cuando reconoce el formato IDRM que
+# hemos observado, imprime una línea legible en el log.
+#
+# QUÉ DEBE BUSCAR EL USUARIO EN EL LOG:
+#
+#   IDRM SNIFFER | FRAME=46 84 5D 9C 02 00 16 95
+#                 | ID=46 84 5D 9C | CH=02 00
+#                 | CMD=16 (UP) | CHECK=95
+#
+# Los 8 bytes significan, según las capturas confirmadas:
+#   bytes 1-4 -> ID del emisor      <-- APUNTAR ESTOS 4 BYTES
+#   bytes 5-6 -> canal
+#   byte 7    -> comando
+#   byte 8    -> check/CRC observado
+#
+# Captura recomendada:
+#   1) Abrir los logs de ESPHome.
+#   2) Pulsar UP 2-3 veces en el mando original.
+#   3) Pulsar STOP 2-3 veces.
+#   4) Pulsar DOWN 2-3 veces.
+#   5) Guardar las líneas completas "IDRM SNIFFER".
+#
+# Si el decodificador automático no muestra nada, se puede
+# descomentar temporalmente "dump: raw" para ver pulsos RAW.
+# ============================================================
+
+remote_receiver:
+  id: idrm_rx
+  pin: GPIO33
+  tolerance: 30%
+  filter: 50us
+  idle: 4ms
+  # dump: raw  # Troubleshooting only: produces a lot of log output.
+
+  on_raw:
+    then:
+      - lambda: |-
+          // Decoder for the 64-bit IDRM frame shape confirmed during
+          // this project's RF captures.
+          //
+          // With idle: 4ms, the ~5ms sync pulse is used by the ESP32
+          // receiver as a frame separator. The useful frame event then
+          // begins approximately as:
+          //   -650, +590, -290, [64 data bits...]
+          // where each data bit is:
+          //   0 -> ~+265 / -625 us
+          //   1 -> ~+590 / -290 us
+
+          auto mag = [](int v) -> int {
+            return v < 0 ? -v : v;
+          };
+
+          // A complete decoded event contains:
+          // sync-space + START mark/space + 64 marks + 63 spaces.
+          if (x.size() < 130)
+            return;
+
+          // Find a plausible start. Usually it is x[0], but scanning
+          // a few positions makes the decoder more tolerant of noise.
+          for (size_t start = 0; start + 129 < x.size() && start < 12; start++) {
+            const int sync_space = mag(x[start]);
+            const int start_mark = mag(x[start + 1]);
+            const int start_space = mag(x[start + 2]);
+
+            if (sync_space < 400 || sync_space > 900)
+              continue;
+            if (start_mark < 430 || start_mark > 800)
+              continue;
+            if (start_space < 150 || start_space > 450)
+              continue;
+
+            uint8_t frame[8] = {0};
+            bool valid = true;
+            const size_t data_start = start + 3;
+
+            for (int bit = 0; bit < 64; bit++) {
+              const size_t mark_index = data_start + static_cast<size_t>(bit) * 2;
+              if (mark_index >= x.size()) {
+                valid = false;
+                break;
+              }
+
+              const int mark = mag(x[mark_index]);
+              bool one;
+
+              if (mark >= 150 && mark <= 400) {
+                one = false;
+              } else if (mark >= 430 && mark <= 800) {
+                one = true;
+              } else {
+                valid = false;
+                break;
+              }
+
+              // Validate the following space for all bits except the
+              // last one (the final long idle may not be present in x).
+              if (bit < 63) {
+                const size_t space_index = mark_index + 1;
+                if (space_index >= x.size()) {
+                  valid = false;
+                  break;
+                }
+
+                const int space = mag(x[space_index]);
+                if (!one && (space < 400 || space > 900)) {
+                  valid = false;
+                  break;
+                }
+                if (one && (space < 150 || space > 450)) {
+                  valid = false;
+                  break;
+                }
+              }
+
+              frame[bit / 8] <<= 1;
+              if (one)
+                frame[bit / 8] |= 0x01;
+            }
+
+            if (!valid)
+              continue;
+
+            const char *cmd_name = "UNKNOWN";
+            switch (frame[6]) {
+              case 0x16: cmd_name = "UP"; break;
+              case 0x46: cmd_name = "STOP"; break;
+              case 0x47: cmd_name = "STOP_CH6"; break;
+              case 0x87: cmd_name = "DOWN"; break;
+              case 0x48: cmd_name = "RELEASE"; break;
+              case 0x49: cmd_name = "RELEASE_CH6"; break;
+            }
+
+            // Ignore obvious noise: the second channel byte has always
+            // been 00 in all confirmed captures in this project.
+            if (frame[5] != 0x00)
+              return;
+
+            ESP_LOGI(
+              "idrm_sniffer",
+              "IDRM SNIFFER | FRAME=%02X %02X %02X %02X %02X %02X %02X %02X | ID=%02X %02X %02X %02X | CH=%02X %02X | CMD=%02X (%s) | CHECK=%02X",
+              frame[0], frame[1], frame[2], frame[3],
+              frame[4], frame[5], frame[6], frame[7],
+              frame[0], frame[1], frame[2], frame[3],
+              frame[4], frame[5], frame[6], cmd_name, frame[7]
+            );
+            return;
+          }
+
 remote_transmitter:
   id: idrm_tx
   pin: GPIO32
@@ -120,9 +296,11 @@ remote_transmitter:
     then:
       - cc1101.begin_tx
 
+  # Return to RX after every transmission so the integrated sniffer
+  # remains active during normal gateway operation.
   on_complete:
     then:
-      - cc1101.set_idle
+      - cc1101.begin_rx
 # ============================================================
 # TRANSMISIÓN RF IDEMO IDRM
 # ============================================================
