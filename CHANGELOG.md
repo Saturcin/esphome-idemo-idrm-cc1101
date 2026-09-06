@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Exposed the four IDRM transmitter-ID bytes as YAML `substitutions`.
+- Documented that the ID should currently come from a legitimate paired remote capture.
+- Documented failed arbitrary-ID pairing experiments and current rolling-code/check-byte uncertainty.
+- Return CC1101 to IDLE after each transmission.
+
 ## 0.1.0-beta
 
 Initial public community release.

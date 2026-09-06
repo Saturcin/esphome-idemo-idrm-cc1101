@@ -57,6 +57,8 @@ Development transmitter ID:
 46 84 5D 9C
 ```
 
+The public YAML exposes these four bytes as `idrm_id_1` … `idrm_id_4`. They should currently be treated as bytes obtained from a legitimate captured remote, not as a freely generated transmitter identity.
+
 ## Channels
 
 | Channel | Bytes |
@@ -79,7 +81,7 @@ DOWN    = 0x87
 RELEASE = 0x48
 ```
 
-Checksum pattern observed:
+Check-byte pattern observed with the development transmitter ID:
 
 ```text
 UP      = 0x93 + channel   (mod 256)
@@ -130,3 +132,17 @@ Exception: confirmed channel-6 STOP does not send RELEASE.
 Some official/legacy Idemo material describes BLU radio products as using IDRM / rolling-code technology. The frames used in this project were experimentally repeatable and accepted during the tests performed, but this repository **does not claim that the complete IDRM rolling-code mechanism has been decoded**.
 
 Do not generalise the observed frame behaviour to every Idemo IDRM product without captures and physical tests.
+
+
+## Other transmitter IDs
+
+The project has not yet captured enough legitimate remotes with different transmitter identities to establish a universal check-byte / rolling-code rule.
+
+An experiment using the artificial ID `46 84 5D 9D` failed to pair, both with the original final check bytes and with adjusted check bytes derived from the additive pattern seen in the development captures.
+
+Therefore:
+
+- transmitter-ID substitutions are provided for configuration convenience;
+- the defaults are known-good for the development installation;
+- arbitrary-ID generation is **not supported**;
+- additional captures from legitimate IDRM remotes are needed.

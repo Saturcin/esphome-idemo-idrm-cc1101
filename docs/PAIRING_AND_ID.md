@@ -1,53 +1,84 @@
-# Transmitter ID and pairing
+# Transmitter ID, capture and pairing status
 
-## The current transmitter ID
+## Current project status
 
-The development YAML uses:
+The gateway transmits using a 4-byte IDRM transmitter identity.
+
+The public YAML exposes those bytes as:
+
+```yaml
+substitutions:
+  idrm_id_1: "0x46"
+  idrm_id_2: "0x84"
+  idrm_id_3: "0x5D"
+  idrm_id_4: "0x9C"
+```
+
+The development identity was:
 
 ```text
 46 84 5D 9C
 ```
 
-It is embedded in both command and release frames.
+This value came from a legitimate physical IDRM remote used during reverse engineering.
 
-This should be treated as an **installation-specific transmitter identity**, not as a universal constant of IDRM.
+## What community users should do today
 
-## Where it appears
+At the current stage of the project, the recommended approach is:
 
-Search the YAML for:
+1. Capture a transmission from a legitimate IDRM remote that is already paired with the target motor.
+2. Decode/identify the first four transmitter-ID bytes.
+3. Put those four bytes into the YAML substitutions.
+4. Validate and flash the gateway.
+5. Test with a single channel before deploying all channels.
 
-```cpp
-const uint8_t frame[8]
+The normal runtime YAML intentionally has no RF receiver/sniffer enabled.
+
+## Why not generate a random ID?
+
+We experimentally tested a second identity:
+
+```text
+46 84 5D 9D
 ```
 
-and:
+and attempted to add it as a new transmitter using the normal IDRM programming procedure.
 
-```cpp
-const uint8_t release_frame[8]
-```
+The motor did not accept it.
 
-The first four bytes are currently:
+A second test also adjusted the final check byte according to the additive pattern observed in the development captures. Pairing still failed.
 
-```cpp
-0x46, 0x84, 0x5D, 0x9C
-```
+Therefore, the project currently does **not** claim that:
 
-## Community recommendation
+- arbitrary 4-byte IDs are valid IDRM transmitter identities;
+- changing only the 4 ID bytes is enough to pair a new transmitter;
+- the complete IDRM rolling-code/pairing mechanism has been decoded.
 
-For a new installation:
+## Check-byte caveat
 
-1. Choose/review the transmitter identity.
-2. Flash the gateway.
-3. Put the target motor into the mode for adding an additional transmitter.
-4. Send an UP command from the relevant gateway channel.
-5. Verify that the motor confirms the new transmitter and responds normally.
+The command/check-byte rules implemented by the project are strongly validated for the development transmitter ID `46 84 5D 9C`.
 
-Idemo documentation for IDRM products commonly describes adding an additional transmitter by holding **STOP** on an already-associated transmitter until the motor indicates programming mode, then pressing **UP** on the new transmitter. Exact behaviour can vary by product, so check the official instructions for your motor.
+However, we currently have captures from only that one legitimate transmitter identity. We therefore cannot yet guarantee that the final check byte generalises unchanged to every other IDRM transmitter identity.
 
-Official Idemo site:
+Captures from additional legitimate IDRM remotes are especially valuable.
 
-https://idemomotors.com/blu-45
+## Pairing information
 
-## Important
+Idemo documentation describes adding an additional transmitter by putting the motor into programming mode with an already-associated transmitter and then pressing UP on the new transmitter.
 
-Do not change transmitter bytes randomly after pairing unless you intend to pair the motor again. From the motor's perspective, a different transmitter identity may be a different remote.
+That tells us the motors can store multiple transmitters, but it does **not** reveal how a valid new IDRM identity / rolling-code state is generated.
+
+This repository therefore documents the official user-level pairing concept but does not claim to reproduce the full transmitter-enrolment algorithm.
+
+## How to contribute a new transmitter capture
+
+Please open an RF capture issue and include:
+
+- motor model;
+- remote model;
+- channel;
+- UP, STOP and DOWN frames;
+- several repeated presses of the same command if possible;
+- whether the remote was already paired or was being enrolled.
+
+See `.github/ISSUE_TEMPLATE/rf_capture.md`.

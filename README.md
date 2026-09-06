@@ -73,7 +73,7 @@ ESPHome includes native CC1101 support and integration with the Remote Transmitt
 4. Validate the YAML in ESPHome.
 5. Flash the ESP32.
 6. Add the ESPHome device to Home Assistant.
-7. Pair the gateway/transmitter with the motors if required.
+7. Enter the four transmitter-ID bytes captured from a legitimate paired IDRM remote.
 8. Fully open or fully close each shutter once to establish a known physical reference.
 9. Fine-tune travel times and calibration curves from Home Assistant.
 
@@ -81,23 +81,23 @@ See [docs/INSTALLATION.md](docs/INSTALLATION.md) and [docs/CALIBRATION.md](docs/
 
 ## Important: transmitter ID
 
-The current YAML contains the experimentally used transmitter identifier:
+The RF transmitter identity is now exposed at the top of the YAML:
 
-```text
-46 84 5D 9C
+```yaml
+substitutions:
+  idrm_id_1: "0x46"
+  idrm_id_2: "0x84"
+  idrm_id_3: "0x5D"
+  idrm_id_4: "0x9C"
 ```
 
-It appears in both the normal and release frames:
+`46 84 5D 9C` is the transmitter ID captured and used during development. It is **not a universal IDRM constant**.
 
-```cpp
-const uint8_t frame[8] = {
-  0x46, 0x84, 0x5D, 0x9C,
-  ch, 0x00,
-  tx_cmd, crc
-};
-```
+For now, the recommended community workflow is to obtain the four ID bytes from a **legitimate IDRM remote already paired to the motor** and enter them in these substitutions.
 
-This ID is part of the RF transmitter identity used during development. **Do not assume it is universally appropriate for every installation.** A community installation should review/change the ID and pair the resulting transmitter identity with its own motors.
+We experimentally tested whether an arbitrary new ID could be paired as a new transmitter. That test failed, even after adjusting the final check byte. Therefore this project currently **does not claim to generate new valid IDRM transmitter identities or implement the complete rolling-code/pairing mechanism**.
+
+> **Checksum caveat:** the command/check-byte logic in this repository has been fully validated only with the development ID `46 84 5D 9C`. Captures from additional legitimate transmitter IDs are needed to confirm how the check byte generalises.
 
 See [docs/PAIRING_AND_ID.md](docs/PAIRING_AND_ID.md).
 

@@ -60,19 +60,31 @@ Más información: [docs/WIRING.md](docs/WIRING.md).
 4. Ejecuta **Validate** en ESPHome.
 5. Instala el firmware.
 6. Añade el dispositivo ESPHome a Home Assistant.
-7. Empareja el emisor con los motores si fuese necesario.
+7. Introduce los cuatro bytes de ID obtenidos de un mando IDRM legítimo ya asociado.
 8. Lleva cada persiana una vez completamente arriba o abajo.
 9. Ajusta tiempos y curvas desde Home Assistant.
 
 ## ID de emisor
 
-El YAML actual utiliza durante el desarrollo:
+La identidad RF del emisor está ahora expuesta al principio del YAML:
 
-```text
-46 84 5D 9C
+```yaml
+substitutions:
+  idrm_id_1: "0x46"
+  idrm_id_2: "0x84"
+  idrm_id_3: "0x5D"
+  idrm_id_4: "0x9C"
 ```
 
-No debe suponerse que ese ID sea universal. Está documentado en [docs/PAIRING_AND_ID.md](docs/PAIRING_AND_ID.md).
+`46 84 5D 9C` es el ID capturado y utilizado durante el desarrollo. **No es una constante universal de IDRM**.
+
+Por el momento, el procedimiento recomendado para otros usuarios es obtener esos cuatro bytes mediante captura de un **mando IDRM legítimo que ya esté asociado al motor** e introducirlos en estas sustituciones.
+
+Hemos probado experimentalmente a generar un ID arbitrario nuevo y emparejarlo como otro mando. La prueba falló incluso ajustando el byte final de comprobación. Por tanto, el proyecto **no afirma actualmente poder generar nuevas identidades IDRM válidas ni implementar por completo el mecanismo de emparejamiento/rolling code**.
+
+> **Advertencia sobre el checksum:** la lógica del byte final utilizada por este repositorio solo está completamente validada con el ID de desarrollo `46 84 5D 9C`. Necesitamos capturas de otros IDs legítimos para confirmar cómo se generaliza.
+
+Consulta [docs/PAIRING_AND_ID.md](docs/PAIRING_AND_ID.md).
 
 ## Canales
 

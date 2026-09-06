@@ -39,7 +39,7 @@ Before flashing, review:
 - Wi-Fi secrets.
 - ESP32 board type.
 - CC1101 wiring.
-- RF transmitter ID (`46 84 5D 9C` in the development configuration).
+- RF transmitter ID substitutions (`idrm_id_1` … `idrm_id_4`). The defaults `46 84 5D 9C` are the development capture, not a universal ID.
 - Number of channels actually used.
 - Opening/closing times.
 - Calibration curves.
@@ -56,9 +56,9 @@ Use the normal ESPHome installation workflow.
 
 After the node is online, Home Assistant should discover the ESPHome device. Add it and check that the six cover entities and calibration/time entities are available.
 
-## 8. Pairing
+## 8. Transmitter identity
 
-If the motor does not recognise the gateway as a transmitter, pairing is required. See `PAIRING_AND_ID.md`.
+At the current project stage, use the four ID bytes captured from a legitimate IDRM remote already paired to the motor. Arbitrary-ID pairing has been tested and did not work. See `PAIRING_AND_ID.md`.
 
 ## 9. Establish a known position
 
