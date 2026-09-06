@@ -1,0 +1,5307 @@
+# ============================================================
+# IDEMO IDRM GATEWAY - 6 PERSIANAS
+# COMMUNITY BETA - MOVIMIENTO DIRECTO MATEMÁTICO
+#
+# ESP32 + CC1101 - 433.92 MHz ASK/OOK
+#
+# CAMBIO FUNDAMENTAL:
+# - NO se usa time_based para decidir la duración de posiciones.
+# - NO se fuerza un extremo antes de cada movimiento.
+# - NO hay delay previo a la orden.
+#
+# Para cada orden de posición:
+#
+#   posición física actual
+#            ↓
+#   inversa de la curva DEL NUEVO SENTIDO
+#            ↓
+#   C_actual_equivalente
+#
+#   posición física destino
+#            ↓
+#   inversa de la misma curva
+#            ↓
+#   C_destino
+#
+#   tiempo =
+#     abs(C_destino - C_actual_equivalente)
+#     × tiempo total de ese sentido
+#
+# Esto permite cambiar de subida a bajada sin arrastrar la
+# posición conceptual de la curva anterior.
+#
+# Curva inicial usada como referencia:
+#
+# SUBIDA:
+#   25:25|50:70|70:90|80:100
+#
+# BAJADA:
+#   25:3|50:7|75:45|85:60|90:75
+#
+# Las curvas son editables desde Home Assistant y persistentes.
+#
+# No se publican sensores adicionales de posición.
+#
+# Canal 6 especial confirmado:
+#   SUBIR   ... 40 00 16 D3
+#   STOP    ... 40 00 47 03  (sin RELEASE)
+#   BAJAR   ... 40 00 87 43
+#   RELEASE ... 40 00 49 05
+# ============================================================
+
+substitutions:
+  persiana_1_nombre: "Persiana Canal 1"
+  persiana_2_nombre: "Persiana Canal 2"
+  persiana_3_nombre: "Persiana Canal 3"
+  persiana_4_nombre: "Persiana Canal 4"
+  persiana_5_nombre: "Persiana Canal 5"
+  persiana_6_nombre: "Persiana Canal 6"
+
+esphome:
+  name: idemo-idrm-gateway
+  friendly_name: Idemo IDRM Gateway
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+spi:
+  clk_pin: GPIO18
+  mosi_pin: GPIO23
+  miso_pin: GPIO19
+
+cc1101:
+  id: radio_idrm
+  cs_pin: GPIO5
+  frequency: 433.92MHz
+  modulation_type: ASK/OOK
+  filter_bandwidth: 203kHz
+  output_power: 10
+
+remote_transmitter:
+  id: idrm_tx
+  pin: GPIO32
+  carrier_duty_percent: 100%
+  non_blocking: false
+
+  on_transmit:
+    then:
+      - cc1101.begin_tx
+# ============================================================
+# TRANSMISIÓN RF IDEMO IDRM
+# ============================================================
+
+script:
+  - id: idrm_send_command
+    mode: queued
+    max_runs: 20
+
+    parameters:
+      channel: int
+      command: int
+
+    then:
+      - lambda: |-
+          const uint8_t ch =
+            static_cast<uint8_t>(channel);
+
+          const uint8_t cmd =
+            static_cast<uint8_t>(command);
+
+          uint8_t tx_cmd = cmd;
+          uint8_t release_cmd = 0x48;
+
+          // Canal 6: variante de grupo confirmada físicamente.
+          if (ch == 0x40) {
+            release_cmd = 0x49;
+
+            if (cmd == 0x46) {
+              tx_cmd = 0x47;
+            }
+          }
+
+          uint8_t crc_base;
+
+          switch (cmd) {
+            case 0x16:
+              crc_base = 0x93;
+              break;
+
+            case 0x46:
+              crc_base = 0xC3;
+              break;
+
+            case 0x87:
+              crc_base = 0x03;
+              break;
+
+            default:
+              ESP_LOGE(
+                "idrm",
+                "Comando IDRM desconocido: 0x%02X",
+                cmd
+              );
+              return;
+          }
+
+          // Suma normal módulo 256.
+          const uint8_t crc =
+            static_cast<uint8_t>(crc_base + ch);
+
+          const uint8_t release_crc =
+            static_cast<uint8_t>(0xC5 + ch);
+
+          const uint8_t frame[8] = {
+            0x46, 0x84, 0x5D, 0x9C,
+            ch, 0x00,
+            tx_cmd, crc
+          };
+
+          const uint8_t release_frame[8] = {
+            0x46, 0x84, 0x5D, 0x9C,
+            ch, 0x00,
+            release_cmd, release_crc
+          };
+
+          auto call = id(idrm_tx).transmit();
+          auto *data = call.get_data();
+          data->reserve(1700);
+
+          auto add_preamble = [&]() {
+            for (int i = 0; i < 8; i++) {
+              data->mark(300);
+              data->space(600);
+            }
+          };
+
+          auto add_frame = [&](const uint8_t *f) {
+            data->mark(5000);
+            data->space(650);
+
+            data->mark(590);
+            data->space(290);
+
+            for (int byte_index = 0; byte_index < 8; byte_index++) {
+              for (int bit_index = 7; bit_index >= 0; bit_index--) {
+                const bool bit =
+                  (f[byte_index] >> bit_index) & 0x01;
+
+                if (bit) {
+                  data->mark(590);
+
+                  if (
+                    byte_index == 7 &&
+                    bit_index == 0
+                  ) {
+                    data->space(5000);
+                  } else {
+                    data->space(290);
+                  }
+                } else {
+                  data->mark(265);
+
+                  if (
+                    byte_index == 7 &&
+                    bit_index == 0
+                  ) {
+                    data->space(5000);
+                  } else {
+                    data->space(625);
+                  }
+                }
+              }
+            }
+          };
+
+          add_preamble();
+
+          for (int i = 0; i < 6; i++) {
+            add_frame(frame);
+          }
+
+          // El STOP especial de canal 6 no lleva RELEASE.
+          const bool send_release =
+            !(ch == 0x40 && cmd == 0x46);
+
+          if (send_release) {
+            add_preamble();
+
+            for (int i = 0; i < 6; i++) {
+              add_frame(release_frame);
+            }
+          }
+
+          ESP_LOGI(
+            "idrm",
+            "TX canal=0x%02X logical=0x%02X real=0x%02X crc=0x%02X release=0x%02X/%02X",
+            ch,
+            cmd,
+            tx_cmd,
+            crc,
+            release_cmd,
+            release_crc
+          );
+
+          call.perform();
+
+  # ==========================================================
+  # MOVIMIENTO DIRECTO MATEMÁTICO
+  # ==========================================================
+
+  - id: p1_stop_actualiza
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(p1_moviendo);
+          then:
+            - script.stop: p1_mover
+
+            - script.execute:
+                id: idrm_send_command
+                channel: 2
+                command: 70
+
+            - if:
+                condition:
+                  lambda: |-
+                    return id(p1_sentido) > 0;
+                then:
+                  - lambda: |-
+                      float cx[12] = {0};
+                      float py[12] = {0};
+
+                      auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                        int n = 0;
+                        x[n] = 0.0f;
+                        y[n] = 0.0f;
+                        n++;
+
+                        size_t start = 0;
+                        while (start < s.size() && n < max_points) {
+                          size_t end = s.find('|', start);
+                          std::string token = s.substr(
+                            start,
+                            end == std::string::npos ? std::string::npos : end - start
+                          );
+
+                          float c = -1.0f;
+                          float p = -1.0f;
+                          if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                            return -1;
+
+                          if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                            return -1;
+
+                          if (c <= 0.0001f && p <= 0.0001f) {
+                            // 0:0 es implícito.
+                          } else {
+                            c /= 100.0f;
+                            p /= 100.0f;
+
+                            if (c <= x[n - 1] + 0.000001f)
+                              return -1;
+                            if (p < y[n - 1] - 0.000001f)
+                              return -1;
+
+                            x[n] = c;
+                            y[n] = p;
+                            n++;
+                          }
+
+                          if (end == std::string::npos)
+                            break;
+                          start = end + 1;
+                        }
+
+                        if (x[n - 1] < 0.9999f) {
+                          if (n >= max_points)
+                            return -1;
+                          x[n] = 1.0f;
+                          y[n] = 1.0f;
+                          n++;
+                        } else {
+                          if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                            return -1;
+                        }
+
+                        return n;
+                      };
+
+                      int puntos = parse_curve(id(p1_curva_subida).state, cx, py, 12);
+
+                      if (puntos < 2) {
+                        // Fallback con la curva por defecto configurada.
+                        cx[0] = 0.0000f;
+                        py[0] = 0.0000f;
+                        cx[1] = 0.2500f;
+                        py[1] = 0.2500f;
+                        cx[2] = 0.5000f;
+                        py[2] = 0.7000f;
+                        cx[3] = 0.7000f;
+                        py[3] = 0.9000f;
+                        cx[4] = 0.8000f;
+                        py[4] = 1.0000f;
+                        cx[5] = 1.0000f;
+                        py[5] = 1.0000f;
+                        puntos = 6;
+                        ESP_LOGW("idrm_cal", "P1 subida: curva invalida; usando lineal");
+                      }
+
+                      auto fisico_a_conceptual = [&](float f) -> float {
+                        if (f <= 0.0f) return 0.0f;
+                        if (f >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dy = py[k] - py[k - 1];
+                          if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                            const float t = (f - py[k - 1]) / dy;
+                            return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                          }
+                        }
+                        return f;
+                      };
+
+                      auto conceptual_a_fisico = [&](float c) -> float {
+                        if (c <= 0.0f) return 0.0f;
+                        if (c >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dx = cx[k] - cx[k - 1];
+                          if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                            const float t = (c - cx[k - 1]) / dx;
+                            return py[k - 1] + t * (py[k] - py[k - 1]);
+                          }
+                        }
+                        return c;
+                      };
+
+                      const uint32_t ahora = millis();
+                      const uint32_t transcurrido = ahora - id(p1_inicio_ms);
+
+                      float fraccion = 1.0f;
+                      if (id(p1_duracion_ms) > 0) {
+                        fraccion =
+                          static_cast<float>(transcurrido) /
+                          static_cast<float>(id(p1_duracion_ms));
+                      }
+
+                      if (fraccion < 0.0f) fraccion = 0.0f;
+                      if (fraccion > 1.0f) fraccion = 1.0f;
+
+                      const float c =
+                        id(p1_c_inicio) +
+                        fraccion *
+                        (id(p1_c_destino) - id(p1_c_inicio));
+
+                      id(p1_fisica) = conceptual_a_fisico(c);
+                      id(p1_moviendo) = false;
+
+                      ESP_LOGI(
+                        "idrm_move",
+                        "P1 STOP subida: C=%.1f%% F=%.1f%%",
+                        c * 100.0f,
+                        id(p1_fisica) * 100.0f
+                      );
+
+                else:
+                  - lambda: |-
+                      float cx[12] = {0};
+                      float py[12] = {0};
+
+                      auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                        int n = 0;
+                        x[n] = 0.0f;
+                        y[n] = 0.0f;
+                        n++;
+
+                        size_t start = 0;
+                        while (start < s.size() && n < max_points) {
+                          size_t end = s.find('|', start);
+                          std::string token = s.substr(
+                            start,
+                            end == std::string::npos ? std::string::npos : end - start
+                          );
+
+                          float c = -1.0f;
+                          float p = -1.0f;
+                          if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                            return -1;
+
+                          if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                            return -1;
+
+                          if (c <= 0.0001f && p <= 0.0001f) {
+                            // 0:0 es implícito.
+                          } else {
+                            c /= 100.0f;
+                            p /= 100.0f;
+
+                            if (c <= x[n - 1] + 0.000001f)
+                              return -1;
+                            if (p < y[n - 1] - 0.000001f)
+                              return -1;
+
+                            x[n] = c;
+                            y[n] = p;
+                            n++;
+                          }
+
+                          if (end == std::string::npos)
+                            break;
+                          start = end + 1;
+                        }
+
+                        if (x[n - 1] < 0.9999f) {
+                          if (n >= max_points)
+                            return -1;
+                          x[n] = 1.0f;
+                          y[n] = 1.0f;
+                          n++;
+                        } else {
+                          if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                            return -1;
+                        }
+
+                        return n;
+                      };
+
+                      int puntos = parse_curve(id(p1_curva_bajada).state, cx, py, 12);
+
+                      if (puntos < 2) {
+                        // Fallback con la curva por defecto configurada.
+                        cx[0] = 0.0000f;
+                        py[0] = 0.0000f;
+                        cx[1] = 0.2500f;
+                        py[1] = 0.0300f;
+                        cx[2] = 0.5000f;
+                        py[2] = 0.0700f;
+                        cx[3] = 0.7500f;
+                        py[3] = 0.4500f;
+                        cx[4] = 0.8500f;
+                        py[4] = 0.6000f;
+                        cx[5] = 0.9000f;
+                        py[5] = 0.7500f;
+                        cx[6] = 1.0000f;
+                        py[6] = 1.0000f;
+                        puntos = 7;
+                        ESP_LOGW("idrm_cal", "P1 bajada: curva invalida; usando lineal");
+                      }
+
+                      auto fisico_a_conceptual = [&](float f) -> float {
+                        if (f <= 0.0f) return 0.0f;
+                        if (f >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dy = py[k] - py[k - 1];
+                          if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                            const float t = (f - py[k - 1]) / dy;
+                            return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                          }
+                        }
+                        return f;
+                      };
+
+                      auto conceptual_a_fisico = [&](float c) -> float {
+                        if (c <= 0.0f) return 0.0f;
+                        if (c >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dx = cx[k] - cx[k - 1];
+                          if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                            const float t = (c - cx[k - 1]) / dx;
+                            return py[k - 1] + t * (py[k] - py[k - 1]);
+                          }
+                        }
+                        return c;
+                      };
+
+                      const uint32_t ahora = millis();
+                      const uint32_t transcurrido = ahora - id(p1_inicio_ms);
+
+                      float fraccion = 1.0f;
+                      if (id(p1_duracion_ms) > 0) {
+                        fraccion =
+                          static_cast<float>(transcurrido) /
+                          static_cast<float>(id(p1_duracion_ms));
+                      }
+
+                      if (fraccion < 0.0f) fraccion = 0.0f;
+                      if (fraccion > 1.0f) fraccion = 1.0f;
+
+                      const float c =
+                        id(p1_c_inicio) +
+                        fraccion *
+                        (id(p1_c_destino) - id(p1_c_inicio));
+
+                      id(p1_fisica) = conceptual_a_fisico(c);
+                      id(p1_moviendo) = false;
+
+                      ESP_LOGI(
+                        "idrm_move",
+                        "P1 STOP bajada: C=%.1f%% F=%.1f%%",
+                        c * 100.0f,
+                        id(p1_fisica) * 100.0f
+                      );
+
+            - cover.template.publish:
+                id: persiana_1
+                position: !lambda |-
+                  return id(p1_fisica);
+                current_operation: IDLE
+
+  - id: p1_mover
+    mode: restart
+    parameters:
+      objetivo: float
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return objetivo > id(p1_fisica) + 0.001f;
+          then:
+            - lambda: |-
+                float cx[12] = {0};
+                float py[12] = {0};
+
+                auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                  int n = 0;
+                  x[n] = 0.0f;
+                  y[n] = 0.0f;
+                  n++;
+
+                  size_t start = 0;
+                  while (start < s.size() && n < max_points) {
+                    size_t end = s.find('|', start);
+                    std::string token = s.substr(
+                      start,
+                      end == std::string::npos ? std::string::npos : end - start
+                    );
+
+                    float c = -1.0f;
+                    float p = -1.0f;
+                    if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                      return -1;
+
+                    if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                      return -1;
+
+                    if (c <= 0.0001f && p <= 0.0001f) {
+                      // 0:0 es implícito.
+                    } else {
+                      c /= 100.0f;
+                      p /= 100.0f;
+
+                      if (c <= x[n - 1] + 0.000001f)
+                        return -1;
+                      if (p < y[n - 1] - 0.000001f)
+                        return -1;
+
+                      x[n] = c;
+                      y[n] = p;
+                      n++;
+                    }
+
+                    if (end == std::string::npos)
+                      break;
+                    start = end + 1;
+                  }
+
+                  if (x[n - 1] < 0.9999f) {
+                    if (n >= max_points)
+                      return -1;
+                    x[n] = 1.0f;
+                    y[n] = 1.0f;
+                    n++;
+                  } else {
+                    if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                      return -1;
+                  }
+
+                  return n;
+                };
+
+                int puntos = parse_curve(id(p1_curva_subida).state, cx, py, 12);
+
+                if (puntos < 2) {
+                  // Fallback con la curva por defecto configurada.
+                  cx[0] = 0.0000f;
+                  py[0] = 0.0000f;
+                  cx[1] = 0.2500f;
+                  py[1] = 0.2500f;
+                  cx[2] = 0.5000f;
+                  py[2] = 0.7000f;
+                  cx[3] = 0.7000f;
+                  py[3] = 0.9000f;
+                  cx[4] = 0.8000f;
+                  py[4] = 1.0000f;
+                  cx[5] = 1.0000f;
+                  py[5] = 1.0000f;
+                  puntos = 6;
+                  ESP_LOGW("idrm_cal", "P1 subida: curva invalida; usando lineal");
+                }
+
+                auto fisico_a_conceptual = [&](float f) -> float {
+                  if (f <= 0.0f) return 0.0f;
+                  if (f >= 1.0f) return 1.0f;
+
+                  for (int k = 1; k < puntos; k++) {
+                    const float dy = py[k] - py[k - 1];
+                    if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                      const float t = (f - py[k - 1]) / dy;
+                      return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                    }
+                  }
+                  return f;
+                };
+
+                auto conceptual_a_fisico = [&](float c) -> float {
+                  if (c <= 0.0f) return 0.0f;
+                  if (c >= 1.0f) return 1.0f;
+
+                  for (int k = 1; k < puntos; k++) {
+                    const float dx = cx[k] - cx[k - 1];
+                    if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                      const float t = (c - cx[k - 1]) / dx;
+                      return py[k - 1] + t * (py[k] - py[k - 1]);
+                    }
+                  }
+                  return c;
+                };
+
+                float destino = objetivo;
+                if (destino < 0.0f) destino = 0.0f;
+                if (destino > 1.0f) destino = 1.0f;
+
+                const float c_actual =
+                  fisico_a_conceptual(id(p1_fisica));
+
+                const float c_destino =
+                  destino >= 0.999f
+                  ? 1.0f
+                  : fisico_a_conceptual(destino);
+
+                float delta = c_destino - c_actual;
+                if (delta < 0.0f) delta = 0.0f;
+
+                id(p1_sentido) = 1;
+                id(p1_c_inicio) = c_actual;
+                id(p1_c_destino) = c_destino;
+                id(p1_fisica_destino) = destino;
+                id(p1_duracion_ms) =
+                  static_cast<uint32_t>(
+                    delta *
+                    id(p1_tiempo_subida).state *
+                    1000.0f
+                  );
+                id(p1_inicio_ms) = millis();
+                id(p1_moviendo) =
+                  id(p1_duracion_ms) >= 30;
+
+                ESP_LOGI(
+                  "idrm_move",
+                  "P1 SUBIDA F %.1f->%.1f C %.1f->%.1f tiempo=%u ms",
+                  id(p1_fisica) * 100.0f,
+                  destino * 100.0f,
+                  c_actual * 100.0f,
+                  c_destino * 100.0f,
+                  id(p1_duracion_ms)
+                );
+
+            - if:
+                condition:
+                  lambda: |-
+                    return id(p1_moviendo);
+                then:
+                  - cover.template.publish:
+                      id: persiana_1
+                      position: !lambda |-
+                        return id(p1_fisica);
+                      current_operation: OPENING
+
+                  - script.execute:
+                      id: idrm_send_command
+                      channel: 2
+                      command: 22
+
+                  - delay: !lambda |-
+                      return id(p1_duracion_ms);
+
+                  - script.execute:
+                      id: idrm_send_command
+                      channel: 2
+                      command: 70
+
+                  - lambda: |-
+                      id(p1_fisica) = id(p1_fisica_destino);
+                      id(p1_moviendo) = false;
+
+                  - cover.template.publish:
+                      id: persiana_1
+                      position: !lambda |-
+                        return id(p1_fisica);
+                      current_operation: IDLE
+
+                else:
+                  - lambda: |-
+                      id(p1_fisica) = objetivo;
+
+                  - cover.template.publish:
+                      id: persiana_1
+                      position: !lambda |-
+                        return id(p1_fisica);
+                      current_operation: IDLE
+
+          else:
+            - if:
+                condition:
+                  lambda: |-
+                    return objetivo < id(p1_fisica) - 0.001f;
+                then:
+                  - lambda: |-
+                      float cx[12] = {0};
+                      float py[12] = {0};
+
+                      auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                        int n = 0;
+                        x[n] = 0.0f;
+                        y[n] = 0.0f;
+                        n++;
+
+                        size_t start = 0;
+                        while (start < s.size() && n < max_points) {
+                          size_t end = s.find('|', start);
+                          std::string token = s.substr(
+                            start,
+                            end == std::string::npos ? std::string::npos : end - start
+                          );
+
+                          float c = -1.0f;
+                          float p = -1.0f;
+                          if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                            return -1;
+
+                          if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                            return -1;
+
+                          if (c <= 0.0001f && p <= 0.0001f) {
+                            // 0:0 es implícito.
+                          } else {
+                            c /= 100.0f;
+                            p /= 100.0f;
+
+                            if (c <= x[n - 1] + 0.000001f)
+                              return -1;
+                            if (p < y[n - 1] - 0.000001f)
+                              return -1;
+
+                            x[n] = c;
+                            y[n] = p;
+                            n++;
+                          }
+
+                          if (end == std::string::npos)
+                            break;
+                          start = end + 1;
+                        }
+
+                        if (x[n - 1] < 0.9999f) {
+                          if (n >= max_points)
+                            return -1;
+                          x[n] = 1.0f;
+                          y[n] = 1.0f;
+                          n++;
+                        } else {
+                          if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                            return -1;
+                        }
+
+                        return n;
+                      };
+
+                      int puntos = parse_curve(id(p1_curva_bajada).state, cx, py, 12);
+
+                      if (puntos < 2) {
+                        // Fallback con la curva por defecto configurada.
+                        cx[0] = 0.0000f;
+                        py[0] = 0.0000f;
+                        cx[1] = 0.2500f;
+                        py[1] = 0.0300f;
+                        cx[2] = 0.5000f;
+                        py[2] = 0.0700f;
+                        cx[3] = 0.7500f;
+                        py[3] = 0.4500f;
+                        cx[4] = 0.8500f;
+                        py[4] = 0.6000f;
+                        cx[5] = 0.9000f;
+                        py[5] = 0.7500f;
+                        cx[6] = 1.0000f;
+                        py[6] = 1.0000f;
+                        puntos = 7;
+                        ESP_LOGW("idrm_cal", "P1 bajada: curva invalida; usando lineal");
+                      }
+
+                      auto fisico_a_conceptual = [&](float f) -> float {
+                        if (f <= 0.0f) return 0.0f;
+                        if (f >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dy = py[k] - py[k - 1];
+                          if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                            const float t = (f - py[k - 1]) / dy;
+                            return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                          }
+                        }
+                        return f;
+                      };
+
+                      auto conceptual_a_fisico = [&](float c) -> float {
+                        if (c <= 0.0f) return 0.0f;
+                        if (c >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dx = cx[k] - cx[k - 1];
+                          if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                            const float t = (c - cx[k - 1]) / dx;
+                            return py[k - 1] + t * (py[k] - py[k - 1]);
+                          }
+                        }
+                        return c;
+                      };
+
+                      float destino = objetivo;
+                      if (destino < 0.0f) destino = 0.0f;
+                      if (destino > 1.0f) destino = 1.0f;
+
+                      const float c_actual =
+                        fisico_a_conceptual(id(p1_fisica));
+
+                      const float c_destino =
+                        destino <= 0.001f
+                        ? 0.0f
+                        : fisico_a_conceptual(destino);
+
+                      float delta = c_actual - c_destino;
+                      if (delta < 0.0f) delta = 0.0f;
+
+                      id(p1_sentido) = -1;
+                      id(p1_c_inicio) = c_actual;
+                      id(p1_c_destino) = c_destino;
+                      id(p1_fisica_destino) = destino;
+                      id(p1_duracion_ms) =
+                        static_cast<uint32_t>(
+                          delta *
+                          id(p1_tiempo_bajada).state *
+                          1000.0f
+                        );
+                      id(p1_inicio_ms) = millis();
+                      id(p1_moviendo) =
+                        id(p1_duracion_ms) >= 30;
+
+                      ESP_LOGI(
+                        "idrm_move",
+                        "P1 BAJADA F %.1f->%.1f C %.1f->%.1f tiempo=%u ms",
+                        id(p1_fisica) * 100.0f,
+                        destino * 100.0f,
+                        c_actual * 100.0f,
+                        c_destino * 100.0f,
+                        id(p1_duracion_ms)
+                      );
+
+                  - if:
+                      condition:
+                        lambda: |-
+                          return id(p1_moviendo);
+                      then:
+                        - cover.template.publish:
+                            id: persiana_1
+                            position: !lambda |-
+                              return id(p1_fisica);
+                            current_operation: CLOSING
+
+                        - script.execute:
+                            id: idrm_send_command
+                            channel: 2
+                            command: 135
+
+                        - delay: !lambda |-
+                            return id(p1_duracion_ms);
+
+                        - script.execute:
+                            id: idrm_send_command
+                            channel: 2
+                            command: 70
+
+                        - lambda: |-
+                            id(p1_fisica) = id(p1_fisica_destino);
+                            id(p1_moviendo) = false;
+
+                        - cover.template.publish:
+                            id: persiana_1
+                            position: !lambda |-
+                              return id(p1_fisica);
+                            current_operation: IDLE
+
+                      else:
+                        - lambda: |-
+                            id(p1_fisica) = objetivo;
+
+                        - cover.template.publish:
+                            id: persiana_1
+                            position: !lambda |-
+                              return id(p1_fisica);
+                            current_operation: IDLE
+
+                else:
+                  - cover.template.publish:
+                      id: persiana_1
+                      position: !lambda |-
+                        return id(p1_fisica);
+                      current_operation: IDLE
+
+  - id: p2_stop_actualiza
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(p2_moviendo);
+          then:
+            - script.stop: p2_mover
+
+            - script.execute:
+                id: idrm_send_command
+                channel: 4
+                command: 70
+
+            - if:
+                condition:
+                  lambda: |-
+                    return id(p2_sentido) > 0;
+                then:
+                  - lambda: |-
+                      float cx[12] = {0};
+                      float py[12] = {0};
+
+                      auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                        int n = 0;
+                        x[n] = 0.0f;
+                        y[n] = 0.0f;
+                        n++;
+
+                        size_t start = 0;
+                        while (start < s.size() && n < max_points) {
+                          size_t end = s.find('|', start);
+                          std::string token = s.substr(
+                            start,
+                            end == std::string::npos ? std::string::npos : end - start
+                          );
+
+                          float c = -1.0f;
+                          float p = -1.0f;
+                          if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                            return -1;
+
+                          if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                            return -1;
+
+                          if (c <= 0.0001f && p <= 0.0001f) {
+                            // 0:0 es implícito.
+                          } else {
+                            c /= 100.0f;
+                            p /= 100.0f;
+
+                            if (c <= x[n - 1] + 0.000001f)
+                              return -1;
+                            if (p < y[n - 1] - 0.000001f)
+                              return -1;
+
+                            x[n] = c;
+                            y[n] = p;
+                            n++;
+                          }
+
+                          if (end == std::string::npos)
+                            break;
+                          start = end + 1;
+                        }
+
+                        if (x[n - 1] < 0.9999f) {
+                          if (n >= max_points)
+                            return -1;
+                          x[n] = 1.0f;
+                          y[n] = 1.0f;
+                          n++;
+                        } else {
+                          if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                            return -1;
+                        }
+
+                        return n;
+                      };
+
+                      int puntos = parse_curve(id(p2_curva_subida).state, cx, py, 12);
+
+                      if (puntos < 2) {
+                        // Fallback con la curva por defecto configurada.
+                        cx[0] = 0.0000f;
+                        py[0] = 0.0000f;
+                        cx[1] = 0.2500f;
+                        py[1] = 0.2500f;
+                        cx[2] = 0.5000f;
+                        py[2] = 0.7000f;
+                        cx[3] = 0.7000f;
+                        py[3] = 0.9000f;
+                        cx[4] = 0.8000f;
+                        py[4] = 1.0000f;
+                        cx[5] = 1.0000f;
+                        py[5] = 1.0000f;
+                        puntos = 6;
+                        ESP_LOGW("idrm_cal", "P2 subida: curva invalida; usando lineal");
+                      }
+
+                      auto fisico_a_conceptual = [&](float f) -> float {
+                        if (f <= 0.0f) return 0.0f;
+                        if (f >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dy = py[k] - py[k - 1];
+                          if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                            const float t = (f - py[k - 1]) / dy;
+                            return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                          }
+                        }
+                        return f;
+                      };
+
+                      auto conceptual_a_fisico = [&](float c) -> float {
+                        if (c <= 0.0f) return 0.0f;
+                        if (c >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dx = cx[k] - cx[k - 1];
+                          if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                            const float t = (c - cx[k - 1]) / dx;
+                            return py[k - 1] + t * (py[k] - py[k - 1]);
+                          }
+                        }
+                        return c;
+                      };
+
+                      const uint32_t ahora = millis();
+                      const uint32_t transcurrido = ahora - id(p2_inicio_ms);
+
+                      float fraccion = 1.0f;
+                      if (id(p2_duracion_ms) > 0) {
+                        fraccion =
+                          static_cast<float>(transcurrido) /
+                          static_cast<float>(id(p2_duracion_ms));
+                      }
+
+                      if (fraccion < 0.0f) fraccion = 0.0f;
+                      if (fraccion > 1.0f) fraccion = 1.0f;
+
+                      const float c =
+                        id(p2_c_inicio) +
+                        fraccion *
+                        (id(p2_c_destino) - id(p2_c_inicio));
+
+                      id(p2_fisica) = conceptual_a_fisico(c);
+                      id(p2_moviendo) = false;
+
+                      ESP_LOGI(
+                        "idrm_move",
+                        "P2 STOP subida: C=%.1f%% F=%.1f%%",
+                        c * 100.0f,
+                        id(p2_fisica) * 100.0f
+                      );
+
+                else:
+                  - lambda: |-
+                      float cx[12] = {0};
+                      float py[12] = {0};
+
+                      auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                        int n = 0;
+                        x[n] = 0.0f;
+                        y[n] = 0.0f;
+                        n++;
+
+                        size_t start = 0;
+                        while (start < s.size() && n < max_points) {
+                          size_t end = s.find('|', start);
+                          std::string token = s.substr(
+                            start,
+                            end == std::string::npos ? std::string::npos : end - start
+                          );
+
+                          float c = -1.0f;
+                          float p = -1.0f;
+                          if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                            return -1;
+
+                          if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                            return -1;
+
+                          if (c <= 0.0001f && p <= 0.0001f) {
+                            // 0:0 es implícito.
+                          } else {
+                            c /= 100.0f;
+                            p /= 100.0f;
+
+                            if (c <= x[n - 1] + 0.000001f)
+                              return -1;
+                            if (p < y[n - 1] - 0.000001f)
+                              return -1;
+
+                            x[n] = c;
+                            y[n] = p;
+                            n++;
+                          }
+
+                          if (end == std::string::npos)
+                            break;
+                          start = end + 1;
+                        }
+
+                        if (x[n - 1] < 0.9999f) {
+                          if (n >= max_points)
+                            return -1;
+                          x[n] = 1.0f;
+                          y[n] = 1.0f;
+                          n++;
+                        } else {
+                          if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                            return -1;
+                        }
+
+                        return n;
+                      };
+
+                      int puntos = parse_curve(id(p2_curva_bajada).state, cx, py, 12);
+
+                      if (puntos < 2) {
+                        // Fallback con la curva por defecto configurada.
+                        cx[0] = 0.0000f;
+                        py[0] = 0.0000f;
+                        cx[1] = 0.2500f;
+                        py[1] = 0.0300f;
+                        cx[2] = 0.5000f;
+                        py[2] = 0.0700f;
+                        cx[3] = 0.7500f;
+                        py[3] = 0.4500f;
+                        cx[4] = 0.8500f;
+                        py[4] = 0.6000f;
+                        cx[5] = 0.9000f;
+                        py[5] = 0.7500f;
+                        cx[6] = 1.0000f;
+                        py[6] = 1.0000f;
+                        puntos = 7;
+                        ESP_LOGW("idrm_cal", "P2 bajada: curva invalida; usando lineal");
+                      }
+
+                      auto fisico_a_conceptual = [&](float f) -> float {
+                        if (f <= 0.0f) return 0.0f;
+                        if (f >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dy = py[k] - py[k - 1];
+                          if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                            const float t = (f - py[k - 1]) / dy;
+                            return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                          }
+                        }
+                        return f;
+                      };
+
+                      auto conceptual_a_fisico = [&](float c) -> float {
+                        if (c <= 0.0f) return 0.0f;
+                        if (c >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dx = cx[k] - cx[k - 1];
+                          if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                            const float t = (c - cx[k - 1]) / dx;
+                            return py[k - 1] + t * (py[k] - py[k - 1]);
+                          }
+                        }
+                        return c;
+                      };
+
+                      const uint32_t ahora = millis();
+                      const uint32_t transcurrido = ahora - id(p2_inicio_ms);
+
+                      float fraccion = 1.0f;
+                      if (id(p2_duracion_ms) > 0) {
+                        fraccion =
+                          static_cast<float>(transcurrido) /
+                          static_cast<float>(id(p2_duracion_ms));
+                      }
+
+                      if (fraccion < 0.0f) fraccion = 0.0f;
+                      if (fraccion > 1.0f) fraccion = 1.0f;
+
+                      const float c =
+                        id(p2_c_inicio) +
+                        fraccion *
+                        (id(p2_c_destino) - id(p2_c_inicio));
+
+                      id(p2_fisica) = conceptual_a_fisico(c);
+                      id(p2_moviendo) = false;
+
+                      ESP_LOGI(
+                        "idrm_move",
+                        "P2 STOP bajada: C=%.1f%% F=%.1f%%",
+                        c * 100.0f,
+                        id(p2_fisica) * 100.0f
+                      );
+
+            - cover.template.publish:
+                id: persiana_2
+                position: !lambda |-
+                  return id(p2_fisica);
+                current_operation: IDLE
+
+  - id: p2_mover
+    mode: restart
+    parameters:
+      objetivo: float
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return objetivo > id(p2_fisica) + 0.001f;
+          then:
+            - lambda: |-
+                float cx[12] = {0};
+                float py[12] = {0};
+
+                auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                  int n = 0;
+                  x[n] = 0.0f;
+                  y[n] = 0.0f;
+                  n++;
+
+                  size_t start = 0;
+                  while (start < s.size() && n < max_points) {
+                    size_t end = s.find('|', start);
+                    std::string token = s.substr(
+                      start,
+                      end == std::string::npos ? std::string::npos : end - start
+                    );
+
+                    float c = -1.0f;
+                    float p = -1.0f;
+                    if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                      return -1;
+
+                    if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                      return -1;
+
+                    if (c <= 0.0001f && p <= 0.0001f) {
+                      // 0:0 es implícito.
+                    } else {
+                      c /= 100.0f;
+                      p /= 100.0f;
+
+                      if (c <= x[n - 1] + 0.000001f)
+                        return -1;
+                      if (p < y[n - 1] - 0.000001f)
+                        return -1;
+
+                      x[n] = c;
+                      y[n] = p;
+                      n++;
+                    }
+
+                    if (end == std::string::npos)
+                      break;
+                    start = end + 1;
+                  }
+
+                  if (x[n - 1] < 0.9999f) {
+                    if (n >= max_points)
+                      return -1;
+                    x[n] = 1.0f;
+                    y[n] = 1.0f;
+                    n++;
+                  } else {
+                    if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                      return -1;
+                  }
+
+                  return n;
+                };
+
+                int puntos = parse_curve(id(p2_curva_subida).state, cx, py, 12);
+
+                if (puntos < 2) {
+                  // Fallback con la curva por defecto configurada.
+                  cx[0] = 0.0000f;
+                  py[0] = 0.0000f;
+                  cx[1] = 0.2500f;
+                  py[1] = 0.2500f;
+                  cx[2] = 0.5000f;
+                  py[2] = 0.7000f;
+                  cx[3] = 0.7000f;
+                  py[3] = 0.9000f;
+                  cx[4] = 0.8000f;
+                  py[4] = 1.0000f;
+                  cx[5] = 1.0000f;
+                  py[5] = 1.0000f;
+                  puntos = 6;
+                  ESP_LOGW("idrm_cal", "P2 subida: curva invalida; usando lineal");
+                }
+
+                auto fisico_a_conceptual = [&](float f) -> float {
+                  if (f <= 0.0f) return 0.0f;
+                  if (f >= 1.0f) return 1.0f;
+
+                  for (int k = 1; k < puntos; k++) {
+                    const float dy = py[k] - py[k - 1];
+                    if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                      const float t = (f - py[k - 1]) / dy;
+                      return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                    }
+                  }
+                  return f;
+                };
+
+                auto conceptual_a_fisico = [&](float c) -> float {
+                  if (c <= 0.0f) return 0.0f;
+                  if (c >= 1.0f) return 1.0f;
+
+                  for (int k = 1; k < puntos; k++) {
+                    const float dx = cx[k] - cx[k - 1];
+                    if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                      const float t = (c - cx[k - 1]) / dx;
+                      return py[k - 1] + t * (py[k] - py[k - 1]);
+                    }
+                  }
+                  return c;
+                };
+
+                float destino = objetivo;
+                if (destino < 0.0f) destino = 0.0f;
+                if (destino > 1.0f) destino = 1.0f;
+
+                const float c_actual =
+                  fisico_a_conceptual(id(p2_fisica));
+
+                const float c_destino =
+                  destino >= 0.999f
+                  ? 1.0f
+                  : fisico_a_conceptual(destino);
+
+                float delta = c_destino - c_actual;
+                if (delta < 0.0f) delta = 0.0f;
+
+                id(p2_sentido) = 1;
+                id(p2_c_inicio) = c_actual;
+                id(p2_c_destino) = c_destino;
+                id(p2_fisica_destino) = destino;
+                id(p2_duracion_ms) =
+                  static_cast<uint32_t>(
+                    delta *
+                    id(p2_tiempo_subida).state *
+                    1000.0f
+                  );
+                id(p2_inicio_ms) = millis();
+                id(p2_moviendo) =
+                  id(p2_duracion_ms) >= 30;
+
+                ESP_LOGI(
+                  "idrm_move",
+                  "P2 SUBIDA F %.1f->%.1f C %.1f->%.1f tiempo=%u ms",
+                  id(p2_fisica) * 100.0f,
+                  destino * 100.0f,
+                  c_actual * 100.0f,
+                  c_destino * 100.0f,
+                  id(p2_duracion_ms)
+                );
+
+            - if:
+                condition:
+                  lambda: |-
+                    return id(p2_moviendo);
+                then:
+                  - cover.template.publish:
+                      id: persiana_2
+                      position: !lambda |-
+                        return id(p2_fisica);
+                      current_operation: OPENING
+
+                  - script.execute:
+                      id: idrm_send_command
+                      channel: 4
+                      command: 22
+
+                  - delay: !lambda |-
+                      return id(p2_duracion_ms);
+
+                  - script.execute:
+                      id: idrm_send_command
+                      channel: 4
+                      command: 70
+
+                  - lambda: |-
+                      id(p2_fisica) = id(p2_fisica_destino);
+                      id(p2_moviendo) = false;
+
+                  - cover.template.publish:
+                      id: persiana_2
+                      position: !lambda |-
+                        return id(p2_fisica);
+                      current_operation: IDLE
+
+                else:
+                  - lambda: |-
+                      id(p2_fisica) = objetivo;
+
+                  - cover.template.publish:
+                      id: persiana_2
+                      position: !lambda |-
+                        return id(p2_fisica);
+                      current_operation: IDLE
+
+          else:
+            - if:
+                condition:
+                  lambda: |-
+                    return objetivo < id(p2_fisica) - 0.001f;
+                then:
+                  - lambda: |-
+                      float cx[12] = {0};
+                      float py[12] = {0};
+
+                      auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                        int n = 0;
+                        x[n] = 0.0f;
+                        y[n] = 0.0f;
+                        n++;
+
+                        size_t start = 0;
+                        while (start < s.size() && n < max_points) {
+                          size_t end = s.find('|', start);
+                          std::string token = s.substr(
+                            start,
+                            end == std::string::npos ? std::string::npos : end - start
+                          );
+
+                          float c = -1.0f;
+                          float p = -1.0f;
+                          if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                            return -1;
+
+                          if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                            return -1;
+
+                          if (c <= 0.0001f && p <= 0.0001f) {
+                            // 0:0 es implícito.
+                          } else {
+                            c /= 100.0f;
+                            p /= 100.0f;
+
+                            if (c <= x[n - 1] + 0.000001f)
+                              return -1;
+                            if (p < y[n - 1] - 0.000001f)
+                              return -1;
+
+                            x[n] = c;
+                            y[n] = p;
+                            n++;
+                          }
+
+                          if (end == std::string::npos)
+                            break;
+                          start = end + 1;
+                        }
+
+                        if (x[n - 1] < 0.9999f) {
+                          if (n >= max_points)
+                            return -1;
+                          x[n] = 1.0f;
+                          y[n] = 1.0f;
+                          n++;
+                        } else {
+                          if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                            return -1;
+                        }
+
+                        return n;
+                      };
+
+                      int puntos = parse_curve(id(p2_curva_bajada).state, cx, py, 12);
+
+                      if (puntos < 2) {
+                        // Fallback con la curva por defecto configurada.
+                        cx[0] = 0.0000f;
+                        py[0] = 0.0000f;
+                        cx[1] = 0.2500f;
+                        py[1] = 0.0300f;
+                        cx[2] = 0.5000f;
+                        py[2] = 0.0700f;
+                        cx[3] = 0.7500f;
+                        py[3] = 0.4500f;
+                        cx[4] = 0.8500f;
+                        py[4] = 0.6000f;
+                        cx[5] = 0.9000f;
+                        py[5] = 0.7500f;
+                        cx[6] = 1.0000f;
+                        py[6] = 1.0000f;
+                        puntos = 7;
+                        ESP_LOGW("idrm_cal", "P2 bajada: curva invalida; usando lineal");
+                      }
+
+                      auto fisico_a_conceptual = [&](float f) -> float {
+                        if (f <= 0.0f) return 0.0f;
+                        if (f >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dy = py[k] - py[k - 1];
+                          if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                            const float t = (f - py[k - 1]) / dy;
+                            return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                          }
+                        }
+                        return f;
+                      };
+
+                      auto conceptual_a_fisico = [&](float c) -> float {
+                        if (c <= 0.0f) return 0.0f;
+                        if (c >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dx = cx[k] - cx[k - 1];
+                          if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                            const float t = (c - cx[k - 1]) / dx;
+                            return py[k - 1] + t * (py[k] - py[k - 1]);
+                          }
+                        }
+                        return c;
+                      };
+
+                      float destino = objetivo;
+                      if (destino < 0.0f) destino = 0.0f;
+                      if (destino > 1.0f) destino = 1.0f;
+
+                      const float c_actual =
+                        fisico_a_conceptual(id(p2_fisica));
+
+                      const float c_destino =
+                        destino <= 0.001f
+                        ? 0.0f
+                        : fisico_a_conceptual(destino);
+
+                      float delta = c_actual - c_destino;
+                      if (delta < 0.0f) delta = 0.0f;
+
+                      id(p2_sentido) = -1;
+                      id(p2_c_inicio) = c_actual;
+                      id(p2_c_destino) = c_destino;
+                      id(p2_fisica_destino) = destino;
+                      id(p2_duracion_ms) =
+                        static_cast<uint32_t>(
+                          delta *
+                          id(p2_tiempo_bajada).state *
+                          1000.0f
+                        );
+                      id(p2_inicio_ms) = millis();
+                      id(p2_moviendo) =
+                        id(p2_duracion_ms) >= 30;
+
+                      ESP_LOGI(
+                        "idrm_move",
+                        "P2 BAJADA F %.1f->%.1f C %.1f->%.1f tiempo=%u ms",
+                        id(p2_fisica) * 100.0f,
+                        destino * 100.0f,
+                        c_actual * 100.0f,
+                        c_destino * 100.0f,
+                        id(p2_duracion_ms)
+                      );
+
+                  - if:
+                      condition:
+                        lambda: |-
+                          return id(p2_moviendo);
+                      then:
+                        - cover.template.publish:
+                            id: persiana_2
+                            position: !lambda |-
+                              return id(p2_fisica);
+                            current_operation: CLOSING
+
+                        - script.execute:
+                            id: idrm_send_command
+                            channel: 4
+                            command: 135
+
+                        - delay: !lambda |-
+                            return id(p2_duracion_ms);
+
+                        - script.execute:
+                            id: idrm_send_command
+                            channel: 4
+                            command: 70
+
+                        - lambda: |-
+                            id(p2_fisica) = id(p2_fisica_destino);
+                            id(p2_moviendo) = false;
+
+                        - cover.template.publish:
+                            id: persiana_2
+                            position: !lambda |-
+                              return id(p2_fisica);
+                            current_operation: IDLE
+
+                      else:
+                        - lambda: |-
+                            id(p2_fisica) = objetivo;
+
+                        - cover.template.publish:
+                            id: persiana_2
+                            position: !lambda |-
+                              return id(p2_fisica);
+                            current_operation: IDLE
+
+                else:
+                  - cover.template.publish:
+                      id: persiana_2
+                      position: !lambda |-
+                        return id(p2_fisica);
+                      current_operation: IDLE
+
+  - id: p3_stop_actualiza
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(p3_moviendo);
+          then:
+            - script.stop: p3_mover
+
+            - script.execute:
+                id: idrm_send_command
+                channel: 8
+                command: 70
+
+            - if:
+                condition:
+                  lambda: |-
+                    return id(p3_sentido) > 0;
+                then:
+                  - lambda: |-
+                      float cx[12] = {0};
+                      float py[12] = {0};
+
+                      auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                        int n = 0;
+                        x[n] = 0.0f;
+                        y[n] = 0.0f;
+                        n++;
+
+                        size_t start = 0;
+                        while (start < s.size() && n < max_points) {
+                          size_t end = s.find('|', start);
+                          std::string token = s.substr(
+                            start,
+                            end == std::string::npos ? std::string::npos : end - start
+                          );
+
+                          float c = -1.0f;
+                          float p = -1.0f;
+                          if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                            return -1;
+
+                          if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                            return -1;
+
+                          if (c <= 0.0001f && p <= 0.0001f) {
+                            // 0:0 es implícito.
+                          } else {
+                            c /= 100.0f;
+                            p /= 100.0f;
+
+                            if (c <= x[n - 1] + 0.000001f)
+                              return -1;
+                            if (p < y[n - 1] - 0.000001f)
+                              return -1;
+
+                            x[n] = c;
+                            y[n] = p;
+                            n++;
+                          }
+
+                          if (end == std::string::npos)
+                            break;
+                          start = end + 1;
+                        }
+
+                        if (x[n - 1] < 0.9999f) {
+                          if (n >= max_points)
+                            return -1;
+                          x[n] = 1.0f;
+                          y[n] = 1.0f;
+                          n++;
+                        } else {
+                          if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                            return -1;
+                        }
+
+                        return n;
+                      };
+
+                      int puntos = parse_curve(id(p3_curva_subida).state, cx, py, 12);
+
+                      if (puntos < 2) {
+                        // Fallback con la curva por defecto configurada.
+                        cx[0] = 0.0000f;
+                        py[0] = 0.0000f;
+                        cx[1] = 0.2500f;
+                        py[1] = 0.2500f;
+                        cx[2] = 0.5000f;
+                        py[2] = 0.7000f;
+                        cx[3] = 0.7000f;
+                        py[3] = 0.9000f;
+                        cx[4] = 0.8000f;
+                        py[4] = 1.0000f;
+                        cx[5] = 1.0000f;
+                        py[5] = 1.0000f;
+                        puntos = 6;
+                        ESP_LOGW("idrm_cal", "P3 subida: curva invalida; usando lineal");
+                      }
+
+                      auto fisico_a_conceptual = [&](float f) -> float {
+                        if (f <= 0.0f) return 0.0f;
+                        if (f >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dy = py[k] - py[k - 1];
+                          if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                            const float t = (f - py[k - 1]) / dy;
+                            return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                          }
+                        }
+                        return f;
+                      };
+
+                      auto conceptual_a_fisico = [&](float c) -> float {
+                        if (c <= 0.0f) return 0.0f;
+                        if (c >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dx = cx[k] - cx[k - 1];
+                          if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                            const float t = (c - cx[k - 1]) / dx;
+                            return py[k - 1] + t * (py[k] - py[k - 1]);
+                          }
+                        }
+                        return c;
+                      };
+
+                      const uint32_t ahora = millis();
+                      const uint32_t transcurrido = ahora - id(p3_inicio_ms);
+
+                      float fraccion = 1.0f;
+                      if (id(p3_duracion_ms) > 0) {
+                        fraccion =
+                          static_cast<float>(transcurrido) /
+                          static_cast<float>(id(p3_duracion_ms));
+                      }
+
+                      if (fraccion < 0.0f) fraccion = 0.0f;
+                      if (fraccion > 1.0f) fraccion = 1.0f;
+
+                      const float c =
+                        id(p3_c_inicio) +
+                        fraccion *
+                        (id(p3_c_destino) - id(p3_c_inicio));
+
+                      id(p3_fisica) = conceptual_a_fisico(c);
+                      id(p3_moviendo) = false;
+
+                      ESP_LOGI(
+                        "idrm_move",
+                        "P3 STOP subida: C=%.1f%% F=%.1f%%",
+                        c * 100.0f,
+                        id(p3_fisica) * 100.0f
+                      );
+
+                else:
+                  - lambda: |-
+                      float cx[12] = {0};
+                      float py[12] = {0};
+
+                      auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                        int n = 0;
+                        x[n] = 0.0f;
+                        y[n] = 0.0f;
+                        n++;
+
+                        size_t start = 0;
+                        while (start < s.size() && n < max_points) {
+                          size_t end = s.find('|', start);
+                          std::string token = s.substr(
+                            start,
+                            end == std::string::npos ? std::string::npos : end - start
+                          );
+
+                          float c = -1.0f;
+                          float p = -1.0f;
+                          if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                            return -1;
+
+                          if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                            return -1;
+
+                          if (c <= 0.0001f && p <= 0.0001f) {
+                            // 0:0 es implícito.
+                          } else {
+                            c /= 100.0f;
+                            p /= 100.0f;
+
+                            if (c <= x[n - 1] + 0.000001f)
+                              return -1;
+                            if (p < y[n - 1] - 0.000001f)
+                              return -1;
+
+                            x[n] = c;
+                            y[n] = p;
+                            n++;
+                          }
+
+                          if (end == std::string::npos)
+                            break;
+                          start = end + 1;
+                        }
+
+                        if (x[n - 1] < 0.9999f) {
+                          if (n >= max_points)
+                            return -1;
+                          x[n] = 1.0f;
+                          y[n] = 1.0f;
+                          n++;
+                        } else {
+                          if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                            return -1;
+                        }
+
+                        return n;
+                      };
+
+                      int puntos = parse_curve(id(p3_curva_bajada).state, cx, py, 12);
+
+                      if (puntos < 2) {
+                        // Fallback con la curva por defecto configurada.
+                        cx[0] = 0.0000f;
+                        py[0] = 0.0000f;
+                        cx[1] = 0.2500f;
+                        py[1] = 0.0300f;
+                        cx[2] = 0.5000f;
+                        py[2] = 0.0700f;
+                        cx[3] = 0.7500f;
+                        py[3] = 0.4500f;
+                        cx[4] = 0.8500f;
+                        py[4] = 0.6000f;
+                        cx[5] = 0.9000f;
+                        py[5] = 0.7500f;
+                        cx[6] = 1.0000f;
+                        py[6] = 1.0000f;
+                        puntos = 7;
+                        ESP_LOGW("idrm_cal", "P3 bajada: curva invalida; usando lineal");
+                      }
+
+                      auto fisico_a_conceptual = [&](float f) -> float {
+                        if (f <= 0.0f) return 0.0f;
+                        if (f >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dy = py[k] - py[k - 1];
+                          if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                            const float t = (f - py[k - 1]) / dy;
+                            return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                          }
+                        }
+                        return f;
+                      };
+
+                      auto conceptual_a_fisico = [&](float c) -> float {
+                        if (c <= 0.0f) return 0.0f;
+                        if (c >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dx = cx[k] - cx[k - 1];
+                          if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                            const float t = (c - cx[k - 1]) / dx;
+                            return py[k - 1] + t * (py[k] - py[k - 1]);
+                          }
+                        }
+                        return c;
+                      };
+
+                      const uint32_t ahora = millis();
+                      const uint32_t transcurrido = ahora - id(p3_inicio_ms);
+
+                      float fraccion = 1.0f;
+                      if (id(p3_duracion_ms) > 0) {
+                        fraccion =
+                          static_cast<float>(transcurrido) /
+                          static_cast<float>(id(p3_duracion_ms));
+                      }
+
+                      if (fraccion < 0.0f) fraccion = 0.0f;
+                      if (fraccion > 1.0f) fraccion = 1.0f;
+
+                      const float c =
+                        id(p3_c_inicio) +
+                        fraccion *
+                        (id(p3_c_destino) - id(p3_c_inicio));
+
+                      id(p3_fisica) = conceptual_a_fisico(c);
+                      id(p3_moviendo) = false;
+
+                      ESP_LOGI(
+                        "idrm_move",
+                        "P3 STOP bajada: C=%.1f%% F=%.1f%%",
+                        c * 100.0f,
+                        id(p3_fisica) * 100.0f
+                      );
+
+            - cover.template.publish:
+                id: persiana_3
+                position: !lambda |-
+                  return id(p3_fisica);
+                current_operation: IDLE
+
+  - id: p3_mover
+    mode: restart
+    parameters:
+      objetivo: float
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return objetivo > id(p3_fisica) + 0.001f;
+          then:
+            - lambda: |-
+                float cx[12] = {0};
+                float py[12] = {0};
+
+                auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                  int n = 0;
+                  x[n] = 0.0f;
+                  y[n] = 0.0f;
+                  n++;
+
+                  size_t start = 0;
+                  while (start < s.size() && n < max_points) {
+                    size_t end = s.find('|', start);
+                    std::string token = s.substr(
+                      start,
+                      end == std::string::npos ? std::string::npos : end - start
+                    );
+
+                    float c = -1.0f;
+                    float p = -1.0f;
+                    if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                      return -1;
+
+                    if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                      return -1;
+
+                    if (c <= 0.0001f && p <= 0.0001f) {
+                      // 0:0 es implícito.
+                    } else {
+                      c /= 100.0f;
+                      p /= 100.0f;
+
+                      if (c <= x[n - 1] + 0.000001f)
+                        return -1;
+                      if (p < y[n - 1] - 0.000001f)
+                        return -1;
+
+                      x[n] = c;
+                      y[n] = p;
+                      n++;
+                    }
+
+                    if (end == std::string::npos)
+                      break;
+                    start = end + 1;
+                  }
+
+                  if (x[n - 1] < 0.9999f) {
+                    if (n >= max_points)
+                      return -1;
+                    x[n] = 1.0f;
+                    y[n] = 1.0f;
+                    n++;
+                  } else {
+                    if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                      return -1;
+                  }
+
+                  return n;
+                };
+
+                int puntos = parse_curve(id(p3_curva_subida).state, cx, py, 12);
+
+                if (puntos < 2) {
+                  // Fallback con la curva por defecto configurada.
+                  cx[0] = 0.0000f;
+                  py[0] = 0.0000f;
+                  cx[1] = 0.2500f;
+                  py[1] = 0.2500f;
+                  cx[2] = 0.5000f;
+                  py[2] = 0.7000f;
+                  cx[3] = 0.7000f;
+                  py[3] = 0.9000f;
+                  cx[4] = 0.8000f;
+                  py[4] = 1.0000f;
+                  cx[5] = 1.0000f;
+                  py[5] = 1.0000f;
+                  puntos = 6;
+                  ESP_LOGW("idrm_cal", "P3 subida: curva invalida; usando lineal");
+                }
+
+                auto fisico_a_conceptual = [&](float f) -> float {
+                  if (f <= 0.0f) return 0.0f;
+                  if (f >= 1.0f) return 1.0f;
+
+                  for (int k = 1; k < puntos; k++) {
+                    const float dy = py[k] - py[k - 1];
+                    if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                      const float t = (f - py[k - 1]) / dy;
+                      return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                    }
+                  }
+                  return f;
+                };
+
+                auto conceptual_a_fisico = [&](float c) -> float {
+                  if (c <= 0.0f) return 0.0f;
+                  if (c >= 1.0f) return 1.0f;
+
+                  for (int k = 1; k < puntos; k++) {
+                    const float dx = cx[k] - cx[k - 1];
+                    if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                      const float t = (c - cx[k - 1]) / dx;
+                      return py[k - 1] + t * (py[k] - py[k - 1]);
+                    }
+                  }
+                  return c;
+                };
+
+                float destino = objetivo;
+                if (destino < 0.0f) destino = 0.0f;
+                if (destino > 1.0f) destino = 1.0f;
+
+                const float c_actual =
+                  fisico_a_conceptual(id(p3_fisica));
+
+                const float c_destino =
+                  destino >= 0.999f
+                  ? 1.0f
+                  : fisico_a_conceptual(destino);
+
+                float delta = c_destino - c_actual;
+                if (delta < 0.0f) delta = 0.0f;
+
+                id(p3_sentido) = 1;
+                id(p3_c_inicio) = c_actual;
+                id(p3_c_destino) = c_destino;
+                id(p3_fisica_destino) = destino;
+                id(p3_duracion_ms) =
+                  static_cast<uint32_t>(
+                    delta *
+                    id(p3_tiempo_subida).state *
+                    1000.0f
+                  );
+                id(p3_inicio_ms) = millis();
+                id(p3_moviendo) =
+                  id(p3_duracion_ms) >= 30;
+
+                ESP_LOGI(
+                  "idrm_move",
+                  "P3 SUBIDA F %.1f->%.1f C %.1f->%.1f tiempo=%u ms",
+                  id(p3_fisica) * 100.0f,
+                  destino * 100.0f,
+                  c_actual * 100.0f,
+                  c_destino * 100.0f,
+                  id(p3_duracion_ms)
+                );
+
+            - if:
+                condition:
+                  lambda: |-
+                    return id(p3_moviendo);
+                then:
+                  - cover.template.publish:
+                      id: persiana_3
+                      position: !lambda |-
+                        return id(p3_fisica);
+                      current_operation: OPENING
+
+                  - script.execute:
+                      id: idrm_send_command
+                      channel: 8
+                      command: 22
+
+                  - delay: !lambda |-
+                      return id(p3_duracion_ms);
+
+                  - script.execute:
+                      id: idrm_send_command
+                      channel: 8
+                      command: 70
+
+                  - lambda: |-
+                      id(p3_fisica) = id(p3_fisica_destino);
+                      id(p3_moviendo) = false;
+
+                  - cover.template.publish:
+                      id: persiana_3
+                      position: !lambda |-
+                        return id(p3_fisica);
+                      current_operation: IDLE
+
+                else:
+                  - lambda: |-
+                      id(p3_fisica) = objetivo;
+
+                  - cover.template.publish:
+                      id: persiana_3
+                      position: !lambda |-
+                        return id(p3_fisica);
+                      current_operation: IDLE
+
+          else:
+            - if:
+                condition:
+                  lambda: |-
+                    return objetivo < id(p3_fisica) - 0.001f;
+                then:
+                  - lambda: |-
+                      float cx[12] = {0};
+                      float py[12] = {0};
+
+                      auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                        int n = 0;
+                        x[n] = 0.0f;
+                        y[n] = 0.0f;
+                        n++;
+
+                        size_t start = 0;
+                        while (start < s.size() && n < max_points) {
+                          size_t end = s.find('|', start);
+                          std::string token = s.substr(
+                            start,
+                            end == std::string::npos ? std::string::npos : end - start
+                          );
+
+                          float c = -1.0f;
+                          float p = -1.0f;
+                          if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                            return -1;
+
+                          if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                            return -1;
+
+                          if (c <= 0.0001f && p <= 0.0001f) {
+                            // 0:0 es implícito.
+                          } else {
+                            c /= 100.0f;
+                            p /= 100.0f;
+
+                            if (c <= x[n - 1] + 0.000001f)
+                              return -1;
+                            if (p < y[n - 1] - 0.000001f)
+                              return -1;
+
+                            x[n] = c;
+                            y[n] = p;
+                            n++;
+                          }
+
+                          if (end == std::string::npos)
+                            break;
+                          start = end + 1;
+                        }
+
+                        if (x[n - 1] < 0.9999f) {
+                          if (n >= max_points)
+                            return -1;
+                          x[n] = 1.0f;
+                          y[n] = 1.0f;
+                          n++;
+                        } else {
+                          if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                            return -1;
+                        }
+
+                        return n;
+                      };
+
+                      int puntos = parse_curve(id(p3_curva_bajada).state, cx, py, 12);
+
+                      if (puntos < 2) {
+                        // Fallback con la curva por defecto configurada.
+                        cx[0] = 0.0000f;
+                        py[0] = 0.0000f;
+                        cx[1] = 0.2500f;
+                        py[1] = 0.0300f;
+                        cx[2] = 0.5000f;
+                        py[2] = 0.0700f;
+                        cx[3] = 0.7500f;
+                        py[3] = 0.4500f;
+                        cx[4] = 0.8500f;
+                        py[4] = 0.6000f;
+                        cx[5] = 0.9000f;
+                        py[5] = 0.7500f;
+                        cx[6] = 1.0000f;
+                        py[6] = 1.0000f;
+                        puntos = 7;
+                        ESP_LOGW("idrm_cal", "P3 bajada: curva invalida; usando lineal");
+                      }
+
+                      auto fisico_a_conceptual = [&](float f) -> float {
+                        if (f <= 0.0f) return 0.0f;
+                        if (f >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dy = py[k] - py[k - 1];
+                          if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                            const float t = (f - py[k - 1]) / dy;
+                            return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                          }
+                        }
+                        return f;
+                      };
+
+                      auto conceptual_a_fisico = [&](float c) -> float {
+                        if (c <= 0.0f) return 0.0f;
+                        if (c >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dx = cx[k] - cx[k - 1];
+                          if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                            const float t = (c - cx[k - 1]) / dx;
+                            return py[k - 1] + t * (py[k] - py[k - 1]);
+                          }
+                        }
+                        return c;
+                      };
+
+                      float destino = objetivo;
+                      if (destino < 0.0f) destino = 0.0f;
+                      if (destino > 1.0f) destino = 1.0f;
+
+                      const float c_actual =
+                        fisico_a_conceptual(id(p3_fisica));
+
+                      const float c_destino =
+                        destino <= 0.001f
+                        ? 0.0f
+                        : fisico_a_conceptual(destino);
+
+                      float delta = c_actual - c_destino;
+                      if (delta < 0.0f) delta = 0.0f;
+
+                      id(p3_sentido) = -1;
+                      id(p3_c_inicio) = c_actual;
+                      id(p3_c_destino) = c_destino;
+                      id(p3_fisica_destino) = destino;
+                      id(p3_duracion_ms) =
+                        static_cast<uint32_t>(
+                          delta *
+                          id(p3_tiempo_bajada).state *
+                          1000.0f
+                        );
+                      id(p3_inicio_ms) = millis();
+                      id(p3_moviendo) =
+                        id(p3_duracion_ms) >= 30;
+
+                      ESP_LOGI(
+                        "idrm_move",
+                        "P3 BAJADA F %.1f->%.1f C %.1f->%.1f tiempo=%u ms",
+                        id(p3_fisica) * 100.0f,
+                        destino * 100.0f,
+                        c_actual * 100.0f,
+                        c_destino * 100.0f,
+                        id(p3_duracion_ms)
+                      );
+
+                  - if:
+                      condition:
+                        lambda: |-
+                          return id(p3_moviendo);
+                      then:
+                        - cover.template.publish:
+                            id: persiana_3
+                            position: !lambda |-
+                              return id(p3_fisica);
+                            current_operation: CLOSING
+
+                        - script.execute:
+                            id: idrm_send_command
+                            channel: 8
+                            command: 135
+
+                        - delay: !lambda |-
+                            return id(p3_duracion_ms);
+
+                        - script.execute:
+                            id: idrm_send_command
+                            channel: 8
+                            command: 70
+
+                        - lambda: |-
+                            id(p3_fisica) = id(p3_fisica_destino);
+                            id(p3_moviendo) = false;
+
+                        - cover.template.publish:
+                            id: persiana_3
+                            position: !lambda |-
+                              return id(p3_fisica);
+                            current_operation: IDLE
+
+                      else:
+                        - lambda: |-
+                            id(p3_fisica) = objetivo;
+
+                        - cover.template.publish:
+                            id: persiana_3
+                            position: !lambda |-
+                              return id(p3_fisica);
+                            current_operation: IDLE
+
+                else:
+                  - cover.template.publish:
+                      id: persiana_3
+                      position: !lambda |-
+                        return id(p3_fisica);
+                      current_operation: IDLE
+
+  - id: p4_stop_actualiza
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(p4_moviendo);
+          then:
+            - script.stop: p4_mover
+
+            - script.execute:
+                id: idrm_send_command
+                channel: 16
+                command: 70
+
+            - if:
+                condition:
+                  lambda: |-
+                    return id(p4_sentido) > 0;
+                then:
+                  - lambda: |-
+                      float cx[12] = {0};
+                      float py[12] = {0};
+
+                      auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                        int n = 0;
+                        x[n] = 0.0f;
+                        y[n] = 0.0f;
+                        n++;
+
+                        size_t start = 0;
+                        while (start < s.size() && n < max_points) {
+                          size_t end = s.find('|', start);
+                          std::string token = s.substr(
+                            start,
+                            end == std::string::npos ? std::string::npos : end - start
+                          );
+
+                          float c = -1.0f;
+                          float p = -1.0f;
+                          if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                            return -1;
+
+                          if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                            return -1;
+
+                          if (c <= 0.0001f && p <= 0.0001f) {
+                            // 0:0 es implícito.
+                          } else {
+                            c /= 100.0f;
+                            p /= 100.0f;
+
+                            if (c <= x[n - 1] + 0.000001f)
+                              return -1;
+                            if (p < y[n - 1] - 0.000001f)
+                              return -1;
+
+                            x[n] = c;
+                            y[n] = p;
+                            n++;
+                          }
+
+                          if (end == std::string::npos)
+                            break;
+                          start = end + 1;
+                        }
+
+                        if (x[n - 1] < 0.9999f) {
+                          if (n >= max_points)
+                            return -1;
+                          x[n] = 1.0f;
+                          y[n] = 1.0f;
+                          n++;
+                        } else {
+                          if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                            return -1;
+                        }
+
+                        return n;
+                      };
+
+                      int puntos = parse_curve(id(p4_curva_subida).state, cx, py, 12);
+
+                      if (puntos < 2) {
+                        // Fallback con la curva por defecto configurada.
+                        cx[0] = 0.0000f;
+                        py[0] = 0.0000f;
+                        cx[1] = 0.2500f;
+                        py[1] = 0.2500f;
+                        cx[2] = 0.5000f;
+                        py[2] = 0.7000f;
+                        cx[3] = 0.7000f;
+                        py[3] = 0.9000f;
+                        cx[4] = 0.8000f;
+                        py[4] = 1.0000f;
+                        cx[5] = 1.0000f;
+                        py[5] = 1.0000f;
+                        puntos = 6;
+                        ESP_LOGW("idrm_cal", "P4 subida: curva invalida; usando lineal");
+                      }
+
+                      auto fisico_a_conceptual = [&](float f) -> float {
+                        if (f <= 0.0f) return 0.0f;
+                        if (f >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dy = py[k] - py[k - 1];
+                          if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                            const float t = (f - py[k - 1]) / dy;
+                            return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                          }
+                        }
+                        return f;
+                      };
+
+                      auto conceptual_a_fisico = [&](float c) -> float {
+                        if (c <= 0.0f) return 0.0f;
+                        if (c >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dx = cx[k] - cx[k - 1];
+                          if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                            const float t = (c - cx[k - 1]) / dx;
+                            return py[k - 1] + t * (py[k] - py[k - 1]);
+                          }
+                        }
+                        return c;
+                      };
+
+                      const uint32_t ahora = millis();
+                      const uint32_t transcurrido = ahora - id(p4_inicio_ms);
+
+                      float fraccion = 1.0f;
+                      if (id(p4_duracion_ms) > 0) {
+                        fraccion =
+                          static_cast<float>(transcurrido) /
+                          static_cast<float>(id(p4_duracion_ms));
+                      }
+
+                      if (fraccion < 0.0f) fraccion = 0.0f;
+                      if (fraccion > 1.0f) fraccion = 1.0f;
+
+                      const float c =
+                        id(p4_c_inicio) +
+                        fraccion *
+                        (id(p4_c_destino) - id(p4_c_inicio));
+
+                      id(p4_fisica) = conceptual_a_fisico(c);
+                      id(p4_moviendo) = false;
+
+                      ESP_LOGI(
+                        "idrm_move",
+                        "P4 STOP subida: C=%.1f%% F=%.1f%%",
+                        c * 100.0f,
+                        id(p4_fisica) * 100.0f
+                      );
+
+                else:
+                  - lambda: |-
+                      float cx[12] = {0};
+                      float py[12] = {0};
+
+                      auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                        int n = 0;
+                        x[n] = 0.0f;
+                        y[n] = 0.0f;
+                        n++;
+
+                        size_t start = 0;
+                        while (start < s.size() && n < max_points) {
+                          size_t end = s.find('|', start);
+                          std::string token = s.substr(
+                            start,
+                            end == std::string::npos ? std::string::npos : end - start
+                          );
+
+                          float c = -1.0f;
+                          float p = -1.0f;
+                          if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                            return -1;
+
+                          if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                            return -1;
+
+                          if (c <= 0.0001f && p <= 0.0001f) {
+                            // 0:0 es implícito.
+                          } else {
+                            c /= 100.0f;
+                            p /= 100.0f;
+
+                            if (c <= x[n - 1] + 0.000001f)
+                              return -1;
+                            if (p < y[n - 1] - 0.000001f)
+                              return -1;
+
+                            x[n] = c;
+                            y[n] = p;
+                            n++;
+                          }
+
+                          if (end == std::string::npos)
+                            break;
+                          start = end + 1;
+                        }
+
+                        if (x[n - 1] < 0.9999f) {
+                          if (n >= max_points)
+                            return -1;
+                          x[n] = 1.0f;
+                          y[n] = 1.0f;
+                          n++;
+                        } else {
+                          if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                            return -1;
+                        }
+
+                        return n;
+                      };
+
+                      int puntos = parse_curve(id(p4_curva_bajada).state, cx, py, 12);
+
+                      if (puntos < 2) {
+                        // Fallback con la curva por defecto configurada.
+                        cx[0] = 0.0000f;
+                        py[0] = 0.0000f;
+                        cx[1] = 0.2500f;
+                        py[1] = 0.0300f;
+                        cx[2] = 0.5000f;
+                        py[2] = 0.0700f;
+                        cx[3] = 0.7500f;
+                        py[3] = 0.4500f;
+                        cx[4] = 0.8500f;
+                        py[4] = 0.6000f;
+                        cx[5] = 0.9000f;
+                        py[5] = 0.7500f;
+                        cx[6] = 1.0000f;
+                        py[6] = 1.0000f;
+                        puntos = 7;
+                        ESP_LOGW("idrm_cal", "P4 bajada: curva invalida; usando lineal");
+                      }
+
+                      auto fisico_a_conceptual = [&](float f) -> float {
+                        if (f <= 0.0f) return 0.0f;
+                        if (f >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dy = py[k] - py[k - 1];
+                          if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                            const float t = (f - py[k - 1]) / dy;
+                            return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                          }
+                        }
+                        return f;
+                      };
+
+                      auto conceptual_a_fisico = [&](float c) -> float {
+                        if (c <= 0.0f) return 0.0f;
+                        if (c >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dx = cx[k] - cx[k - 1];
+                          if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                            const float t = (c - cx[k - 1]) / dx;
+                            return py[k - 1] + t * (py[k] - py[k - 1]);
+                          }
+                        }
+                        return c;
+                      };
+
+                      const uint32_t ahora = millis();
+                      const uint32_t transcurrido = ahora - id(p4_inicio_ms);
+
+                      float fraccion = 1.0f;
+                      if (id(p4_duracion_ms) > 0) {
+                        fraccion =
+                          static_cast<float>(transcurrido) /
+                          static_cast<float>(id(p4_duracion_ms));
+                      }
+
+                      if (fraccion < 0.0f) fraccion = 0.0f;
+                      if (fraccion > 1.0f) fraccion = 1.0f;
+
+                      const float c =
+                        id(p4_c_inicio) +
+                        fraccion *
+                        (id(p4_c_destino) - id(p4_c_inicio));
+
+                      id(p4_fisica) = conceptual_a_fisico(c);
+                      id(p4_moviendo) = false;
+
+                      ESP_LOGI(
+                        "idrm_move",
+                        "P4 STOP bajada: C=%.1f%% F=%.1f%%",
+                        c * 100.0f,
+                        id(p4_fisica) * 100.0f
+                      );
+
+            - cover.template.publish:
+                id: persiana_4
+                position: !lambda |-
+                  return id(p4_fisica);
+                current_operation: IDLE
+
+  - id: p4_mover
+    mode: restart
+    parameters:
+      objetivo: float
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return objetivo > id(p4_fisica) + 0.001f;
+          then:
+            - lambda: |-
+                float cx[12] = {0};
+                float py[12] = {0};
+
+                auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                  int n = 0;
+                  x[n] = 0.0f;
+                  y[n] = 0.0f;
+                  n++;
+
+                  size_t start = 0;
+                  while (start < s.size() && n < max_points) {
+                    size_t end = s.find('|', start);
+                    std::string token = s.substr(
+                      start,
+                      end == std::string::npos ? std::string::npos : end - start
+                    );
+
+                    float c = -1.0f;
+                    float p = -1.0f;
+                    if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                      return -1;
+
+                    if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                      return -1;
+
+                    if (c <= 0.0001f && p <= 0.0001f) {
+                      // 0:0 es implícito.
+                    } else {
+                      c /= 100.0f;
+                      p /= 100.0f;
+
+                      if (c <= x[n - 1] + 0.000001f)
+                        return -1;
+                      if (p < y[n - 1] - 0.000001f)
+                        return -1;
+
+                      x[n] = c;
+                      y[n] = p;
+                      n++;
+                    }
+
+                    if (end == std::string::npos)
+                      break;
+                    start = end + 1;
+                  }
+
+                  if (x[n - 1] < 0.9999f) {
+                    if (n >= max_points)
+                      return -1;
+                    x[n] = 1.0f;
+                    y[n] = 1.0f;
+                    n++;
+                  } else {
+                    if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                      return -1;
+                  }
+
+                  return n;
+                };
+
+                int puntos = parse_curve(id(p4_curva_subida).state, cx, py, 12);
+
+                if (puntos < 2) {
+                  // Fallback con la curva por defecto configurada.
+                  cx[0] = 0.0000f;
+                  py[0] = 0.0000f;
+                  cx[1] = 0.2500f;
+                  py[1] = 0.2500f;
+                  cx[2] = 0.5000f;
+                  py[2] = 0.7000f;
+                  cx[3] = 0.7000f;
+                  py[3] = 0.9000f;
+                  cx[4] = 0.8000f;
+                  py[4] = 1.0000f;
+                  cx[5] = 1.0000f;
+                  py[5] = 1.0000f;
+                  puntos = 6;
+                  ESP_LOGW("idrm_cal", "P4 subida: curva invalida; usando lineal");
+                }
+
+                auto fisico_a_conceptual = [&](float f) -> float {
+                  if (f <= 0.0f) return 0.0f;
+                  if (f >= 1.0f) return 1.0f;
+
+                  for (int k = 1; k < puntos; k++) {
+                    const float dy = py[k] - py[k - 1];
+                    if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                      const float t = (f - py[k - 1]) / dy;
+                      return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                    }
+                  }
+                  return f;
+                };
+
+                auto conceptual_a_fisico = [&](float c) -> float {
+                  if (c <= 0.0f) return 0.0f;
+                  if (c >= 1.0f) return 1.0f;
+
+                  for (int k = 1; k < puntos; k++) {
+                    const float dx = cx[k] - cx[k - 1];
+                    if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                      const float t = (c - cx[k - 1]) / dx;
+                      return py[k - 1] + t * (py[k] - py[k - 1]);
+                    }
+                  }
+                  return c;
+                };
+
+                float destino = objetivo;
+                if (destino < 0.0f) destino = 0.0f;
+                if (destino > 1.0f) destino = 1.0f;
+
+                const float c_actual =
+                  fisico_a_conceptual(id(p4_fisica));
+
+                const float c_destino =
+                  destino >= 0.999f
+                  ? 1.0f
+                  : fisico_a_conceptual(destino);
+
+                float delta = c_destino - c_actual;
+                if (delta < 0.0f) delta = 0.0f;
+
+                id(p4_sentido) = 1;
+                id(p4_c_inicio) = c_actual;
+                id(p4_c_destino) = c_destino;
+                id(p4_fisica_destino) = destino;
+                id(p4_duracion_ms) =
+                  static_cast<uint32_t>(
+                    delta *
+                    id(p4_tiempo_subida).state *
+                    1000.0f
+                  );
+                id(p4_inicio_ms) = millis();
+                id(p4_moviendo) =
+                  id(p4_duracion_ms) >= 30;
+
+                ESP_LOGI(
+                  "idrm_move",
+                  "P4 SUBIDA F %.1f->%.1f C %.1f->%.1f tiempo=%u ms",
+                  id(p4_fisica) * 100.0f,
+                  destino * 100.0f,
+                  c_actual * 100.0f,
+                  c_destino * 100.0f,
+                  id(p4_duracion_ms)
+                );
+
+            - if:
+                condition:
+                  lambda: |-
+                    return id(p4_moviendo);
+                then:
+                  - cover.template.publish:
+                      id: persiana_4
+                      position: !lambda |-
+                        return id(p4_fisica);
+                      current_operation: OPENING
+
+                  - script.execute:
+                      id: idrm_send_command
+                      channel: 16
+                      command: 22
+
+                  - delay: !lambda |-
+                      return id(p4_duracion_ms);
+
+                  - script.execute:
+                      id: idrm_send_command
+                      channel: 16
+                      command: 70
+
+                  - lambda: |-
+                      id(p4_fisica) = id(p4_fisica_destino);
+                      id(p4_moviendo) = false;
+
+                  - cover.template.publish:
+                      id: persiana_4
+                      position: !lambda |-
+                        return id(p4_fisica);
+                      current_operation: IDLE
+
+                else:
+                  - lambda: |-
+                      id(p4_fisica) = objetivo;
+
+                  - cover.template.publish:
+                      id: persiana_4
+                      position: !lambda |-
+                        return id(p4_fisica);
+                      current_operation: IDLE
+
+          else:
+            - if:
+                condition:
+                  lambda: |-
+                    return objetivo < id(p4_fisica) - 0.001f;
+                then:
+                  - lambda: |-
+                      float cx[12] = {0};
+                      float py[12] = {0};
+
+                      auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                        int n = 0;
+                        x[n] = 0.0f;
+                        y[n] = 0.0f;
+                        n++;
+
+                        size_t start = 0;
+                        while (start < s.size() && n < max_points) {
+                          size_t end = s.find('|', start);
+                          std::string token = s.substr(
+                            start,
+                            end == std::string::npos ? std::string::npos : end - start
+                          );
+
+                          float c = -1.0f;
+                          float p = -1.0f;
+                          if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                            return -1;
+
+                          if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                            return -1;
+
+                          if (c <= 0.0001f && p <= 0.0001f) {
+                            // 0:0 es implícito.
+                          } else {
+                            c /= 100.0f;
+                            p /= 100.0f;
+
+                            if (c <= x[n - 1] + 0.000001f)
+                              return -1;
+                            if (p < y[n - 1] - 0.000001f)
+                              return -1;
+
+                            x[n] = c;
+                            y[n] = p;
+                            n++;
+                          }
+
+                          if (end == std::string::npos)
+                            break;
+                          start = end + 1;
+                        }
+
+                        if (x[n - 1] < 0.9999f) {
+                          if (n >= max_points)
+                            return -1;
+                          x[n] = 1.0f;
+                          y[n] = 1.0f;
+                          n++;
+                        } else {
+                          if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                            return -1;
+                        }
+
+                        return n;
+                      };
+
+                      int puntos = parse_curve(id(p4_curva_bajada).state, cx, py, 12);
+
+                      if (puntos < 2) {
+                        // Fallback con la curva por defecto configurada.
+                        cx[0] = 0.0000f;
+                        py[0] = 0.0000f;
+                        cx[1] = 0.2500f;
+                        py[1] = 0.0300f;
+                        cx[2] = 0.5000f;
+                        py[2] = 0.0700f;
+                        cx[3] = 0.7500f;
+                        py[3] = 0.4500f;
+                        cx[4] = 0.8500f;
+                        py[4] = 0.6000f;
+                        cx[5] = 0.9000f;
+                        py[5] = 0.7500f;
+                        cx[6] = 1.0000f;
+                        py[6] = 1.0000f;
+                        puntos = 7;
+                        ESP_LOGW("idrm_cal", "P4 bajada: curva invalida; usando lineal");
+                      }
+
+                      auto fisico_a_conceptual = [&](float f) -> float {
+                        if (f <= 0.0f) return 0.0f;
+                        if (f >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dy = py[k] - py[k - 1];
+                          if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                            const float t = (f - py[k - 1]) / dy;
+                            return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                          }
+                        }
+                        return f;
+                      };
+
+                      auto conceptual_a_fisico = [&](float c) -> float {
+                        if (c <= 0.0f) return 0.0f;
+                        if (c >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dx = cx[k] - cx[k - 1];
+                          if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                            const float t = (c - cx[k - 1]) / dx;
+                            return py[k - 1] + t * (py[k] - py[k - 1]);
+                          }
+                        }
+                        return c;
+                      };
+
+                      float destino = objetivo;
+                      if (destino < 0.0f) destino = 0.0f;
+                      if (destino > 1.0f) destino = 1.0f;
+
+                      const float c_actual =
+                        fisico_a_conceptual(id(p4_fisica));
+
+                      const float c_destino =
+                        destino <= 0.001f
+                        ? 0.0f
+                        : fisico_a_conceptual(destino);
+
+                      float delta = c_actual - c_destino;
+                      if (delta < 0.0f) delta = 0.0f;
+
+                      id(p4_sentido) = -1;
+                      id(p4_c_inicio) = c_actual;
+                      id(p4_c_destino) = c_destino;
+                      id(p4_fisica_destino) = destino;
+                      id(p4_duracion_ms) =
+                        static_cast<uint32_t>(
+                          delta *
+                          id(p4_tiempo_bajada).state *
+                          1000.0f
+                        );
+                      id(p4_inicio_ms) = millis();
+                      id(p4_moviendo) =
+                        id(p4_duracion_ms) >= 30;
+
+                      ESP_LOGI(
+                        "idrm_move",
+                        "P4 BAJADA F %.1f->%.1f C %.1f->%.1f tiempo=%u ms",
+                        id(p4_fisica) * 100.0f,
+                        destino * 100.0f,
+                        c_actual * 100.0f,
+                        c_destino * 100.0f,
+                        id(p4_duracion_ms)
+                      );
+
+                  - if:
+                      condition:
+                        lambda: |-
+                          return id(p4_moviendo);
+                      then:
+                        - cover.template.publish:
+                            id: persiana_4
+                            position: !lambda |-
+                              return id(p4_fisica);
+                            current_operation: CLOSING
+
+                        - script.execute:
+                            id: idrm_send_command
+                            channel: 16
+                            command: 135
+
+                        - delay: !lambda |-
+                            return id(p4_duracion_ms);
+
+                        - script.execute:
+                            id: idrm_send_command
+                            channel: 16
+                            command: 70
+
+                        - lambda: |-
+                            id(p4_fisica) = id(p4_fisica_destino);
+                            id(p4_moviendo) = false;
+
+                        - cover.template.publish:
+                            id: persiana_4
+                            position: !lambda |-
+                              return id(p4_fisica);
+                            current_operation: IDLE
+
+                      else:
+                        - lambda: |-
+                            id(p4_fisica) = objetivo;
+
+                        - cover.template.publish:
+                            id: persiana_4
+                            position: !lambda |-
+                              return id(p4_fisica);
+                            current_operation: IDLE
+
+                else:
+                  - cover.template.publish:
+                      id: persiana_4
+                      position: !lambda |-
+                        return id(p4_fisica);
+                      current_operation: IDLE
+
+  - id: p5_stop_actualiza
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(p5_moviendo);
+          then:
+            - script.stop: p5_mover
+
+            - script.execute:
+                id: idrm_send_command
+                channel: 32
+                command: 70
+
+            - if:
+                condition:
+                  lambda: |-
+                    return id(p5_sentido) > 0;
+                then:
+                  - lambda: |-
+                      float cx[12] = {0};
+                      float py[12] = {0};
+
+                      auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                        int n = 0;
+                        x[n] = 0.0f;
+                        y[n] = 0.0f;
+                        n++;
+
+                        size_t start = 0;
+                        while (start < s.size() && n < max_points) {
+                          size_t end = s.find('|', start);
+                          std::string token = s.substr(
+                            start,
+                            end == std::string::npos ? std::string::npos : end - start
+                          );
+
+                          float c = -1.0f;
+                          float p = -1.0f;
+                          if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                            return -1;
+
+                          if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                            return -1;
+
+                          if (c <= 0.0001f && p <= 0.0001f) {
+                            // 0:0 es implícito.
+                          } else {
+                            c /= 100.0f;
+                            p /= 100.0f;
+
+                            if (c <= x[n - 1] + 0.000001f)
+                              return -1;
+                            if (p < y[n - 1] - 0.000001f)
+                              return -1;
+
+                            x[n] = c;
+                            y[n] = p;
+                            n++;
+                          }
+
+                          if (end == std::string::npos)
+                            break;
+                          start = end + 1;
+                        }
+
+                        if (x[n - 1] < 0.9999f) {
+                          if (n >= max_points)
+                            return -1;
+                          x[n] = 1.0f;
+                          y[n] = 1.0f;
+                          n++;
+                        } else {
+                          if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                            return -1;
+                        }
+
+                        return n;
+                      };
+
+                      int puntos = parse_curve(id(p5_curva_subida).state, cx, py, 12);
+
+                      if (puntos < 2) {
+                        // Fallback con la curva por defecto configurada.
+                        cx[0] = 0.0000f;
+                        py[0] = 0.0000f;
+                        cx[1] = 0.2500f;
+                        py[1] = 0.2500f;
+                        cx[2] = 0.5000f;
+                        py[2] = 0.7000f;
+                        cx[3] = 0.7000f;
+                        py[3] = 0.9000f;
+                        cx[4] = 0.8000f;
+                        py[4] = 1.0000f;
+                        cx[5] = 1.0000f;
+                        py[5] = 1.0000f;
+                        puntos = 6;
+                        ESP_LOGW("idrm_cal", "P5 subida: curva invalida; usando lineal");
+                      }
+
+                      auto fisico_a_conceptual = [&](float f) -> float {
+                        if (f <= 0.0f) return 0.0f;
+                        if (f >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dy = py[k] - py[k - 1];
+                          if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                            const float t = (f - py[k - 1]) / dy;
+                            return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                          }
+                        }
+                        return f;
+                      };
+
+                      auto conceptual_a_fisico = [&](float c) -> float {
+                        if (c <= 0.0f) return 0.0f;
+                        if (c >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dx = cx[k] - cx[k - 1];
+                          if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                            const float t = (c - cx[k - 1]) / dx;
+                            return py[k - 1] + t * (py[k] - py[k - 1]);
+                          }
+                        }
+                        return c;
+                      };
+
+                      const uint32_t ahora = millis();
+                      const uint32_t transcurrido = ahora - id(p5_inicio_ms);
+
+                      float fraccion = 1.0f;
+                      if (id(p5_duracion_ms) > 0) {
+                        fraccion =
+                          static_cast<float>(transcurrido) /
+                          static_cast<float>(id(p5_duracion_ms));
+                      }
+
+                      if (fraccion < 0.0f) fraccion = 0.0f;
+                      if (fraccion > 1.0f) fraccion = 1.0f;
+
+                      const float c =
+                        id(p5_c_inicio) +
+                        fraccion *
+                        (id(p5_c_destino) - id(p5_c_inicio));
+
+                      id(p5_fisica) = conceptual_a_fisico(c);
+                      id(p5_moviendo) = false;
+
+                      ESP_LOGI(
+                        "idrm_move",
+                        "P5 STOP subida: C=%.1f%% F=%.1f%%",
+                        c * 100.0f,
+                        id(p5_fisica) * 100.0f
+                      );
+
+                else:
+                  - lambda: |-
+                      float cx[12] = {0};
+                      float py[12] = {0};
+
+                      auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                        int n = 0;
+                        x[n] = 0.0f;
+                        y[n] = 0.0f;
+                        n++;
+
+                        size_t start = 0;
+                        while (start < s.size() && n < max_points) {
+                          size_t end = s.find('|', start);
+                          std::string token = s.substr(
+                            start,
+                            end == std::string::npos ? std::string::npos : end - start
+                          );
+
+                          float c = -1.0f;
+                          float p = -1.0f;
+                          if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                            return -1;
+
+                          if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                            return -1;
+
+                          if (c <= 0.0001f && p <= 0.0001f) {
+                            // 0:0 es implícito.
+                          } else {
+                            c /= 100.0f;
+                            p /= 100.0f;
+
+                            if (c <= x[n - 1] + 0.000001f)
+                              return -1;
+                            if (p < y[n - 1] - 0.000001f)
+                              return -1;
+
+                            x[n] = c;
+                            y[n] = p;
+                            n++;
+                          }
+
+                          if (end == std::string::npos)
+                            break;
+                          start = end + 1;
+                        }
+
+                        if (x[n - 1] < 0.9999f) {
+                          if (n >= max_points)
+                            return -1;
+                          x[n] = 1.0f;
+                          y[n] = 1.0f;
+                          n++;
+                        } else {
+                          if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                            return -1;
+                        }
+
+                        return n;
+                      };
+
+                      int puntos = parse_curve(id(p5_curva_bajada).state, cx, py, 12);
+
+                      if (puntos < 2) {
+                        // Fallback con la curva por defecto configurada.
+                        cx[0] = 0.0000f;
+                        py[0] = 0.0000f;
+                        cx[1] = 0.2500f;
+                        py[1] = 0.0300f;
+                        cx[2] = 0.5000f;
+                        py[2] = 0.0700f;
+                        cx[3] = 0.7500f;
+                        py[3] = 0.4500f;
+                        cx[4] = 0.8500f;
+                        py[4] = 0.6000f;
+                        cx[5] = 0.9000f;
+                        py[5] = 0.7500f;
+                        cx[6] = 1.0000f;
+                        py[6] = 1.0000f;
+                        puntos = 7;
+                        ESP_LOGW("idrm_cal", "P5 bajada: curva invalida; usando lineal");
+                      }
+
+                      auto fisico_a_conceptual = [&](float f) -> float {
+                        if (f <= 0.0f) return 0.0f;
+                        if (f >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dy = py[k] - py[k - 1];
+                          if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                            const float t = (f - py[k - 1]) / dy;
+                            return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                          }
+                        }
+                        return f;
+                      };
+
+                      auto conceptual_a_fisico = [&](float c) -> float {
+                        if (c <= 0.0f) return 0.0f;
+                        if (c >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dx = cx[k] - cx[k - 1];
+                          if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                            const float t = (c - cx[k - 1]) / dx;
+                            return py[k - 1] + t * (py[k] - py[k - 1]);
+                          }
+                        }
+                        return c;
+                      };
+
+                      const uint32_t ahora = millis();
+                      const uint32_t transcurrido = ahora - id(p5_inicio_ms);
+
+                      float fraccion = 1.0f;
+                      if (id(p5_duracion_ms) > 0) {
+                        fraccion =
+                          static_cast<float>(transcurrido) /
+                          static_cast<float>(id(p5_duracion_ms));
+                      }
+
+                      if (fraccion < 0.0f) fraccion = 0.0f;
+                      if (fraccion > 1.0f) fraccion = 1.0f;
+
+                      const float c =
+                        id(p5_c_inicio) +
+                        fraccion *
+                        (id(p5_c_destino) - id(p5_c_inicio));
+
+                      id(p5_fisica) = conceptual_a_fisico(c);
+                      id(p5_moviendo) = false;
+
+                      ESP_LOGI(
+                        "idrm_move",
+                        "P5 STOP bajada: C=%.1f%% F=%.1f%%",
+                        c * 100.0f,
+                        id(p5_fisica) * 100.0f
+                      );
+
+            - cover.template.publish:
+                id: persiana_5
+                position: !lambda |-
+                  return id(p5_fisica);
+                current_operation: IDLE
+
+  - id: p5_mover
+    mode: restart
+    parameters:
+      objetivo: float
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return objetivo > id(p5_fisica) + 0.001f;
+          then:
+            - lambda: |-
+                float cx[12] = {0};
+                float py[12] = {0};
+
+                auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                  int n = 0;
+                  x[n] = 0.0f;
+                  y[n] = 0.0f;
+                  n++;
+
+                  size_t start = 0;
+                  while (start < s.size() && n < max_points) {
+                    size_t end = s.find('|', start);
+                    std::string token = s.substr(
+                      start,
+                      end == std::string::npos ? std::string::npos : end - start
+                    );
+
+                    float c = -1.0f;
+                    float p = -1.0f;
+                    if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                      return -1;
+
+                    if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                      return -1;
+
+                    if (c <= 0.0001f && p <= 0.0001f) {
+                      // 0:0 es implícito.
+                    } else {
+                      c /= 100.0f;
+                      p /= 100.0f;
+
+                      if (c <= x[n - 1] + 0.000001f)
+                        return -1;
+                      if (p < y[n - 1] - 0.000001f)
+                        return -1;
+
+                      x[n] = c;
+                      y[n] = p;
+                      n++;
+                    }
+
+                    if (end == std::string::npos)
+                      break;
+                    start = end + 1;
+                  }
+
+                  if (x[n - 1] < 0.9999f) {
+                    if (n >= max_points)
+                      return -1;
+                    x[n] = 1.0f;
+                    y[n] = 1.0f;
+                    n++;
+                  } else {
+                    if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                      return -1;
+                  }
+
+                  return n;
+                };
+
+                int puntos = parse_curve(id(p5_curva_subida).state, cx, py, 12);
+
+                if (puntos < 2) {
+                  // Fallback con la curva por defecto configurada.
+                  cx[0] = 0.0000f;
+                  py[0] = 0.0000f;
+                  cx[1] = 0.2500f;
+                  py[1] = 0.2500f;
+                  cx[2] = 0.5000f;
+                  py[2] = 0.7000f;
+                  cx[3] = 0.7000f;
+                  py[3] = 0.9000f;
+                  cx[4] = 0.8000f;
+                  py[4] = 1.0000f;
+                  cx[5] = 1.0000f;
+                  py[5] = 1.0000f;
+                  puntos = 6;
+                  ESP_LOGW("idrm_cal", "P5 subida: curva invalida; usando lineal");
+                }
+
+                auto fisico_a_conceptual = [&](float f) -> float {
+                  if (f <= 0.0f) return 0.0f;
+                  if (f >= 1.0f) return 1.0f;
+
+                  for (int k = 1; k < puntos; k++) {
+                    const float dy = py[k] - py[k - 1];
+                    if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                      const float t = (f - py[k - 1]) / dy;
+                      return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                    }
+                  }
+                  return f;
+                };
+
+                auto conceptual_a_fisico = [&](float c) -> float {
+                  if (c <= 0.0f) return 0.0f;
+                  if (c >= 1.0f) return 1.0f;
+
+                  for (int k = 1; k < puntos; k++) {
+                    const float dx = cx[k] - cx[k - 1];
+                    if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                      const float t = (c - cx[k - 1]) / dx;
+                      return py[k - 1] + t * (py[k] - py[k - 1]);
+                    }
+                  }
+                  return c;
+                };
+
+                float destino = objetivo;
+                if (destino < 0.0f) destino = 0.0f;
+                if (destino > 1.0f) destino = 1.0f;
+
+                const float c_actual =
+                  fisico_a_conceptual(id(p5_fisica));
+
+                const float c_destino =
+                  destino >= 0.999f
+                  ? 1.0f
+                  : fisico_a_conceptual(destino);
+
+                float delta = c_destino - c_actual;
+                if (delta < 0.0f) delta = 0.0f;
+
+                id(p5_sentido) = 1;
+                id(p5_c_inicio) = c_actual;
+                id(p5_c_destino) = c_destino;
+                id(p5_fisica_destino) = destino;
+                id(p5_duracion_ms) =
+                  static_cast<uint32_t>(
+                    delta *
+                    id(p5_tiempo_subida).state *
+                    1000.0f
+                  );
+                id(p5_inicio_ms) = millis();
+                id(p5_moviendo) =
+                  id(p5_duracion_ms) >= 30;
+
+                ESP_LOGI(
+                  "idrm_move",
+                  "P5 SUBIDA F %.1f->%.1f C %.1f->%.1f tiempo=%u ms",
+                  id(p5_fisica) * 100.0f,
+                  destino * 100.0f,
+                  c_actual * 100.0f,
+                  c_destino * 100.0f,
+                  id(p5_duracion_ms)
+                );
+
+            - if:
+                condition:
+                  lambda: |-
+                    return id(p5_moviendo);
+                then:
+                  - cover.template.publish:
+                      id: persiana_5
+                      position: !lambda |-
+                        return id(p5_fisica);
+                      current_operation: OPENING
+
+                  - script.execute:
+                      id: idrm_send_command
+                      channel: 32
+                      command: 22
+
+                  - delay: !lambda |-
+                      return id(p5_duracion_ms);
+
+                  - script.execute:
+                      id: idrm_send_command
+                      channel: 32
+                      command: 70
+
+                  - lambda: |-
+                      id(p5_fisica) = id(p5_fisica_destino);
+                      id(p5_moviendo) = false;
+
+                  - cover.template.publish:
+                      id: persiana_5
+                      position: !lambda |-
+                        return id(p5_fisica);
+                      current_operation: IDLE
+
+                else:
+                  - lambda: |-
+                      id(p5_fisica) = objetivo;
+
+                  - cover.template.publish:
+                      id: persiana_5
+                      position: !lambda |-
+                        return id(p5_fisica);
+                      current_operation: IDLE
+
+          else:
+            - if:
+                condition:
+                  lambda: |-
+                    return objetivo < id(p5_fisica) - 0.001f;
+                then:
+                  - lambda: |-
+                      float cx[12] = {0};
+                      float py[12] = {0};
+
+                      auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                        int n = 0;
+                        x[n] = 0.0f;
+                        y[n] = 0.0f;
+                        n++;
+
+                        size_t start = 0;
+                        while (start < s.size() && n < max_points) {
+                          size_t end = s.find('|', start);
+                          std::string token = s.substr(
+                            start,
+                            end == std::string::npos ? std::string::npos : end - start
+                          );
+
+                          float c = -1.0f;
+                          float p = -1.0f;
+                          if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                            return -1;
+
+                          if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                            return -1;
+
+                          if (c <= 0.0001f && p <= 0.0001f) {
+                            // 0:0 es implícito.
+                          } else {
+                            c /= 100.0f;
+                            p /= 100.0f;
+
+                            if (c <= x[n - 1] + 0.000001f)
+                              return -1;
+                            if (p < y[n - 1] - 0.000001f)
+                              return -1;
+
+                            x[n] = c;
+                            y[n] = p;
+                            n++;
+                          }
+
+                          if (end == std::string::npos)
+                            break;
+                          start = end + 1;
+                        }
+
+                        if (x[n - 1] < 0.9999f) {
+                          if (n >= max_points)
+                            return -1;
+                          x[n] = 1.0f;
+                          y[n] = 1.0f;
+                          n++;
+                        } else {
+                          if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                            return -1;
+                        }
+
+                        return n;
+                      };
+
+                      int puntos = parse_curve(id(p5_curva_bajada).state, cx, py, 12);
+
+                      if (puntos < 2) {
+                        // Fallback con la curva por defecto configurada.
+                        cx[0] = 0.0000f;
+                        py[0] = 0.0000f;
+                        cx[1] = 0.2500f;
+                        py[1] = 0.0300f;
+                        cx[2] = 0.5000f;
+                        py[2] = 0.0700f;
+                        cx[3] = 0.7500f;
+                        py[3] = 0.4500f;
+                        cx[4] = 0.8500f;
+                        py[4] = 0.6000f;
+                        cx[5] = 0.9000f;
+                        py[5] = 0.7500f;
+                        cx[6] = 1.0000f;
+                        py[6] = 1.0000f;
+                        puntos = 7;
+                        ESP_LOGW("idrm_cal", "P5 bajada: curva invalida; usando lineal");
+                      }
+
+                      auto fisico_a_conceptual = [&](float f) -> float {
+                        if (f <= 0.0f) return 0.0f;
+                        if (f >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dy = py[k] - py[k - 1];
+                          if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                            const float t = (f - py[k - 1]) / dy;
+                            return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                          }
+                        }
+                        return f;
+                      };
+
+                      auto conceptual_a_fisico = [&](float c) -> float {
+                        if (c <= 0.0f) return 0.0f;
+                        if (c >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dx = cx[k] - cx[k - 1];
+                          if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                            const float t = (c - cx[k - 1]) / dx;
+                            return py[k - 1] + t * (py[k] - py[k - 1]);
+                          }
+                        }
+                        return c;
+                      };
+
+                      float destino = objetivo;
+                      if (destino < 0.0f) destino = 0.0f;
+                      if (destino > 1.0f) destino = 1.0f;
+
+                      const float c_actual =
+                        fisico_a_conceptual(id(p5_fisica));
+
+                      const float c_destino =
+                        destino <= 0.001f
+                        ? 0.0f
+                        : fisico_a_conceptual(destino);
+
+                      float delta = c_actual - c_destino;
+                      if (delta < 0.0f) delta = 0.0f;
+
+                      id(p5_sentido) = -1;
+                      id(p5_c_inicio) = c_actual;
+                      id(p5_c_destino) = c_destino;
+                      id(p5_fisica_destino) = destino;
+                      id(p5_duracion_ms) =
+                        static_cast<uint32_t>(
+                          delta *
+                          id(p5_tiempo_bajada).state *
+                          1000.0f
+                        );
+                      id(p5_inicio_ms) = millis();
+                      id(p5_moviendo) =
+                        id(p5_duracion_ms) >= 30;
+
+                      ESP_LOGI(
+                        "idrm_move",
+                        "P5 BAJADA F %.1f->%.1f C %.1f->%.1f tiempo=%u ms",
+                        id(p5_fisica) * 100.0f,
+                        destino * 100.0f,
+                        c_actual * 100.0f,
+                        c_destino * 100.0f,
+                        id(p5_duracion_ms)
+                      );
+
+                  - if:
+                      condition:
+                        lambda: |-
+                          return id(p5_moviendo);
+                      then:
+                        - cover.template.publish:
+                            id: persiana_5
+                            position: !lambda |-
+                              return id(p5_fisica);
+                            current_operation: CLOSING
+
+                        - script.execute:
+                            id: idrm_send_command
+                            channel: 32
+                            command: 135
+
+                        - delay: !lambda |-
+                            return id(p5_duracion_ms);
+
+                        - script.execute:
+                            id: idrm_send_command
+                            channel: 32
+                            command: 70
+
+                        - lambda: |-
+                            id(p5_fisica) = id(p5_fisica_destino);
+                            id(p5_moviendo) = false;
+
+                        - cover.template.publish:
+                            id: persiana_5
+                            position: !lambda |-
+                              return id(p5_fisica);
+                            current_operation: IDLE
+
+                      else:
+                        - lambda: |-
+                            id(p5_fisica) = objetivo;
+
+                        - cover.template.publish:
+                            id: persiana_5
+                            position: !lambda |-
+                              return id(p5_fisica);
+                            current_operation: IDLE
+
+                else:
+                  - cover.template.publish:
+                      id: persiana_5
+                      position: !lambda |-
+                        return id(p5_fisica);
+                      current_operation: IDLE
+
+  - id: p6_stop_actualiza
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(p6_moviendo);
+          then:
+            - script.stop: p6_mover
+
+            - script.execute:
+                id: idrm_send_command
+                channel: 64
+                command: 70
+
+            - if:
+                condition:
+                  lambda: |-
+                    return id(p6_sentido) > 0;
+                then:
+                  - lambda: |-
+                      float cx[12] = {0};
+                      float py[12] = {0};
+
+                      auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                        int n = 0;
+                        x[n] = 0.0f;
+                        y[n] = 0.0f;
+                        n++;
+
+                        size_t start = 0;
+                        while (start < s.size() && n < max_points) {
+                          size_t end = s.find('|', start);
+                          std::string token = s.substr(
+                            start,
+                            end == std::string::npos ? std::string::npos : end - start
+                          );
+
+                          float c = -1.0f;
+                          float p = -1.0f;
+                          if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                            return -1;
+
+                          if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                            return -1;
+
+                          if (c <= 0.0001f && p <= 0.0001f) {
+                            // 0:0 es implícito.
+                          } else {
+                            c /= 100.0f;
+                            p /= 100.0f;
+
+                            if (c <= x[n - 1] + 0.000001f)
+                              return -1;
+                            if (p < y[n - 1] - 0.000001f)
+                              return -1;
+
+                            x[n] = c;
+                            y[n] = p;
+                            n++;
+                          }
+
+                          if (end == std::string::npos)
+                            break;
+                          start = end + 1;
+                        }
+
+                        if (x[n - 1] < 0.9999f) {
+                          if (n >= max_points)
+                            return -1;
+                          x[n] = 1.0f;
+                          y[n] = 1.0f;
+                          n++;
+                        } else {
+                          if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                            return -1;
+                        }
+
+                        return n;
+                      };
+
+                      int puntos = parse_curve(id(p6_curva_subida).state, cx, py, 12);
+
+                      if (puntos < 2) {
+                        // Fallback con la curva por defecto configurada.
+                        cx[0] = 0.0000f;
+                        py[0] = 0.0000f;
+                        cx[1] = 0.2500f;
+                        py[1] = 0.2500f;
+                        cx[2] = 0.5000f;
+                        py[2] = 0.7000f;
+                        cx[3] = 0.7000f;
+                        py[3] = 0.9000f;
+                        cx[4] = 0.8000f;
+                        py[4] = 1.0000f;
+                        cx[5] = 1.0000f;
+                        py[5] = 1.0000f;
+                        puntos = 6;
+                        ESP_LOGW("idrm_cal", "P6 subida: curva invalida; usando lineal");
+                      }
+
+                      auto fisico_a_conceptual = [&](float f) -> float {
+                        if (f <= 0.0f) return 0.0f;
+                        if (f >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dy = py[k] - py[k - 1];
+                          if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                            const float t = (f - py[k - 1]) / dy;
+                            return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                          }
+                        }
+                        return f;
+                      };
+
+                      auto conceptual_a_fisico = [&](float c) -> float {
+                        if (c <= 0.0f) return 0.0f;
+                        if (c >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dx = cx[k] - cx[k - 1];
+                          if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                            const float t = (c - cx[k - 1]) / dx;
+                            return py[k - 1] + t * (py[k] - py[k - 1]);
+                          }
+                        }
+                        return c;
+                      };
+
+                      const uint32_t ahora = millis();
+                      const uint32_t transcurrido = ahora - id(p6_inicio_ms);
+
+                      float fraccion = 1.0f;
+                      if (id(p6_duracion_ms) > 0) {
+                        fraccion =
+                          static_cast<float>(transcurrido) /
+                          static_cast<float>(id(p6_duracion_ms));
+                      }
+
+                      if (fraccion < 0.0f) fraccion = 0.0f;
+                      if (fraccion > 1.0f) fraccion = 1.0f;
+
+                      const float c =
+                        id(p6_c_inicio) +
+                        fraccion *
+                        (id(p6_c_destino) - id(p6_c_inicio));
+
+                      id(p6_fisica) = conceptual_a_fisico(c);
+                      id(p6_moviendo) = false;
+
+                      ESP_LOGI(
+                        "idrm_move",
+                        "P6 STOP subida: C=%.1f%% F=%.1f%%",
+                        c * 100.0f,
+                        id(p6_fisica) * 100.0f
+                      );
+
+                else:
+                  - lambda: |-
+                      float cx[12] = {0};
+                      float py[12] = {0};
+
+                      auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                        int n = 0;
+                        x[n] = 0.0f;
+                        y[n] = 0.0f;
+                        n++;
+
+                        size_t start = 0;
+                        while (start < s.size() && n < max_points) {
+                          size_t end = s.find('|', start);
+                          std::string token = s.substr(
+                            start,
+                            end == std::string::npos ? std::string::npos : end - start
+                          );
+
+                          float c = -1.0f;
+                          float p = -1.0f;
+                          if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                            return -1;
+
+                          if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                            return -1;
+
+                          if (c <= 0.0001f && p <= 0.0001f) {
+                            // 0:0 es implícito.
+                          } else {
+                            c /= 100.0f;
+                            p /= 100.0f;
+
+                            if (c <= x[n - 1] + 0.000001f)
+                              return -1;
+                            if (p < y[n - 1] - 0.000001f)
+                              return -1;
+
+                            x[n] = c;
+                            y[n] = p;
+                            n++;
+                          }
+
+                          if (end == std::string::npos)
+                            break;
+                          start = end + 1;
+                        }
+
+                        if (x[n - 1] < 0.9999f) {
+                          if (n >= max_points)
+                            return -1;
+                          x[n] = 1.0f;
+                          y[n] = 1.0f;
+                          n++;
+                        } else {
+                          if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                            return -1;
+                        }
+
+                        return n;
+                      };
+
+                      int puntos = parse_curve(id(p6_curva_bajada).state, cx, py, 12);
+
+                      if (puntos < 2) {
+                        // Fallback con la curva por defecto configurada.
+                        cx[0] = 0.0000f;
+                        py[0] = 0.0000f;
+                        cx[1] = 0.2500f;
+                        py[1] = 0.0300f;
+                        cx[2] = 0.5000f;
+                        py[2] = 0.0700f;
+                        cx[3] = 0.7500f;
+                        py[3] = 0.4500f;
+                        cx[4] = 0.8500f;
+                        py[4] = 0.6000f;
+                        cx[5] = 0.9000f;
+                        py[5] = 0.7500f;
+                        cx[6] = 1.0000f;
+                        py[6] = 1.0000f;
+                        puntos = 7;
+                        ESP_LOGW("idrm_cal", "P6 bajada: curva invalida; usando lineal");
+                      }
+
+                      auto fisico_a_conceptual = [&](float f) -> float {
+                        if (f <= 0.0f) return 0.0f;
+                        if (f >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dy = py[k] - py[k - 1];
+                          if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                            const float t = (f - py[k - 1]) / dy;
+                            return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                          }
+                        }
+                        return f;
+                      };
+
+                      auto conceptual_a_fisico = [&](float c) -> float {
+                        if (c <= 0.0f) return 0.0f;
+                        if (c >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dx = cx[k] - cx[k - 1];
+                          if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                            const float t = (c - cx[k - 1]) / dx;
+                            return py[k - 1] + t * (py[k] - py[k - 1]);
+                          }
+                        }
+                        return c;
+                      };
+
+                      const uint32_t ahora = millis();
+                      const uint32_t transcurrido = ahora - id(p6_inicio_ms);
+
+                      float fraccion = 1.0f;
+                      if (id(p6_duracion_ms) > 0) {
+                        fraccion =
+                          static_cast<float>(transcurrido) /
+                          static_cast<float>(id(p6_duracion_ms));
+                      }
+
+                      if (fraccion < 0.0f) fraccion = 0.0f;
+                      if (fraccion > 1.0f) fraccion = 1.0f;
+
+                      const float c =
+                        id(p6_c_inicio) +
+                        fraccion *
+                        (id(p6_c_destino) - id(p6_c_inicio));
+
+                      id(p6_fisica) = conceptual_a_fisico(c);
+                      id(p6_moviendo) = false;
+
+                      ESP_LOGI(
+                        "idrm_move",
+                        "P6 STOP bajada: C=%.1f%% F=%.1f%%",
+                        c * 100.0f,
+                        id(p6_fisica) * 100.0f
+                      );
+
+            - cover.template.publish:
+                id: persiana_6
+                position: !lambda |-
+                  return id(p6_fisica);
+                current_operation: IDLE
+
+  - id: p6_mover
+    mode: restart
+    parameters:
+      objetivo: float
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return objetivo > id(p6_fisica) + 0.001f;
+          then:
+            - lambda: |-
+                float cx[12] = {0};
+                float py[12] = {0};
+
+                auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                  int n = 0;
+                  x[n] = 0.0f;
+                  y[n] = 0.0f;
+                  n++;
+
+                  size_t start = 0;
+                  while (start < s.size() && n < max_points) {
+                    size_t end = s.find('|', start);
+                    std::string token = s.substr(
+                      start,
+                      end == std::string::npos ? std::string::npos : end - start
+                    );
+
+                    float c = -1.0f;
+                    float p = -1.0f;
+                    if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                      return -1;
+
+                    if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                      return -1;
+
+                    if (c <= 0.0001f && p <= 0.0001f) {
+                      // 0:0 es implícito.
+                    } else {
+                      c /= 100.0f;
+                      p /= 100.0f;
+
+                      if (c <= x[n - 1] + 0.000001f)
+                        return -1;
+                      if (p < y[n - 1] - 0.000001f)
+                        return -1;
+
+                      x[n] = c;
+                      y[n] = p;
+                      n++;
+                    }
+
+                    if (end == std::string::npos)
+                      break;
+                    start = end + 1;
+                  }
+
+                  if (x[n - 1] < 0.9999f) {
+                    if (n >= max_points)
+                      return -1;
+                    x[n] = 1.0f;
+                    y[n] = 1.0f;
+                    n++;
+                  } else {
+                    if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                      return -1;
+                  }
+
+                  return n;
+                };
+
+                int puntos = parse_curve(id(p6_curva_subida).state, cx, py, 12);
+
+                if (puntos < 2) {
+                  // Fallback con la curva por defecto configurada.
+                  cx[0] = 0.0000f;
+                  py[0] = 0.0000f;
+                  cx[1] = 0.2500f;
+                  py[1] = 0.2500f;
+                  cx[2] = 0.5000f;
+                  py[2] = 0.7000f;
+                  cx[3] = 0.7000f;
+                  py[3] = 0.9000f;
+                  cx[4] = 0.8000f;
+                  py[4] = 1.0000f;
+                  cx[5] = 1.0000f;
+                  py[5] = 1.0000f;
+                  puntos = 6;
+                  ESP_LOGW("idrm_cal", "P6 subida: curva invalida; usando lineal");
+                }
+
+                auto fisico_a_conceptual = [&](float f) -> float {
+                  if (f <= 0.0f) return 0.0f;
+                  if (f >= 1.0f) return 1.0f;
+
+                  for (int k = 1; k < puntos; k++) {
+                    const float dy = py[k] - py[k - 1];
+                    if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                      const float t = (f - py[k - 1]) / dy;
+                      return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                    }
+                  }
+                  return f;
+                };
+
+                auto conceptual_a_fisico = [&](float c) -> float {
+                  if (c <= 0.0f) return 0.0f;
+                  if (c >= 1.0f) return 1.0f;
+
+                  for (int k = 1; k < puntos; k++) {
+                    const float dx = cx[k] - cx[k - 1];
+                    if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                      const float t = (c - cx[k - 1]) / dx;
+                      return py[k - 1] + t * (py[k] - py[k - 1]);
+                    }
+                  }
+                  return c;
+                };
+
+                float destino = objetivo;
+                if (destino < 0.0f) destino = 0.0f;
+                if (destino > 1.0f) destino = 1.0f;
+
+                const float c_actual =
+                  fisico_a_conceptual(id(p6_fisica));
+
+                const float c_destino =
+                  destino >= 0.999f
+                  ? 1.0f
+                  : fisico_a_conceptual(destino);
+
+                float delta = c_destino - c_actual;
+                if (delta < 0.0f) delta = 0.0f;
+
+                id(p6_sentido) = 1;
+                id(p6_c_inicio) = c_actual;
+                id(p6_c_destino) = c_destino;
+                id(p6_fisica_destino) = destino;
+                id(p6_duracion_ms) =
+                  static_cast<uint32_t>(
+                    delta *
+                    id(p6_tiempo_subida).state *
+                    1000.0f
+                  );
+                id(p6_inicio_ms) = millis();
+                id(p6_moviendo) =
+                  id(p6_duracion_ms) >= 30;
+
+                ESP_LOGI(
+                  "idrm_move",
+                  "P6 SUBIDA F %.1f->%.1f C %.1f->%.1f tiempo=%u ms",
+                  id(p6_fisica) * 100.0f,
+                  destino * 100.0f,
+                  c_actual * 100.0f,
+                  c_destino * 100.0f,
+                  id(p6_duracion_ms)
+                );
+
+            - if:
+                condition:
+                  lambda: |-
+                    return id(p6_moviendo);
+                then:
+                  - cover.template.publish:
+                      id: persiana_6
+                      position: !lambda |-
+                        return id(p6_fisica);
+                      current_operation: OPENING
+
+                  - script.execute:
+                      id: idrm_send_command
+                      channel: 64
+                      command: 22
+
+                  - delay: !lambda |-
+                      return id(p6_duracion_ms);
+
+                  - script.execute:
+                      id: idrm_send_command
+                      channel: 64
+                      command: 70
+
+                  - lambda: |-
+                      id(p6_fisica) = id(p6_fisica_destino);
+                      id(p6_moviendo) = false;
+
+                  - cover.template.publish:
+                      id: persiana_6
+                      position: !lambda |-
+                        return id(p6_fisica);
+                      current_operation: IDLE
+
+                else:
+                  - lambda: |-
+                      id(p6_fisica) = objetivo;
+
+                  - cover.template.publish:
+                      id: persiana_6
+                      position: !lambda |-
+                        return id(p6_fisica);
+                      current_operation: IDLE
+
+          else:
+            - if:
+                condition:
+                  lambda: |-
+                    return objetivo < id(p6_fisica) - 0.001f;
+                then:
+                  - lambda: |-
+                      float cx[12] = {0};
+                      float py[12] = {0};
+
+                      auto parse_curve = [](const std::string &s, float *x, float *y, int max_points) -> int {
+                        int n = 0;
+                        x[n] = 0.0f;
+                        y[n] = 0.0f;
+                        n++;
+
+                        size_t start = 0;
+                        while (start < s.size() && n < max_points) {
+                          size_t end = s.find('|', start);
+                          std::string token = s.substr(
+                            start,
+                            end == std::string::npos ? std::string::npos : end - start
+                          );
+
+                          float c = -1.0f;
+                          float p = -1.0f;
+                          if (sscanf(token.c_str(), " %f : %f ", &c, &p) != 2)
+                            return -1;
+
+                          if (c < 0.0f || c > 100.0f || p < 0.0f || p > 100.0f)
+                            return -1;
+
+                          if (c <= 0.0001f && p <= 0.0001f) {
+                            // 0:0 es implícito.
+                          } else {
+                            c /= 100.0f;
+                            p /= 100.0f;
+
+                            if (c <= x[n - 1] + 0.000001f)
+                              return -1;
+                            if (p < y[n - 1] - 0.000001f)
+                              return -1;
+
+                            x[n] = c;
+                            y[n] = p;
+                            n++;
+                          }
+
+                          if (end == std::string::npos)
+                            break;
+                          start = end + 1;
+                        }
+
+                        if (x[n - 1] < 0.9999f) {
+                          if (n >= max_points)
+                            return -1;
+                          x[n] = 1.0f;
+                          y[n] = 1.0f;
+                          n++;
+                        } else {
+                          if (y[n - 1] < 0.999f || y[n - 1] > 1.001f)
+                            return -1;
+                        }
+
+                        return n;
+                      };
+
+                      int puntos = parse_curve(id(p6_curva_bajada).state, cx, py, 12);
+
+                      if (puntos < 2) {
+                        // Fallback con la curva por defecto configurada.
+                        cx[0] = 0.0000f;
+                        py[0] = 0.0000f;
+                        cx[1] = 0.2500f;
+                        py[1] = 0.0300f;
+                        cx[2] = 0.5000f;
+                        py[2] = 0.0700f;
+                        cx[3] = 0.7500f;
+                        py[3] = 0.4500f;
+                        cx[4] = 0.8500f;
+                        py[4] = 0.6000f;
+                        cx[5] = 0.9000f;
+                        py[5] = 0.7500f;
+                        cx[6] = 1.0000f;
+                        py[6] = 1.0000f;
+                        puntos = 7;
+                        ESP_LOGW("idrm_cal", "P6 bajada: curva invalida; usando lineal");
+                      }
+
+                      auto fisico_a_conceptual = [&](float f) -> float {
+                        if (f <= 0.0f) return 0.0f;
+                        if (f >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dy = py[k] - py[k - 1];
+                          if (f <= py[k] + 0.000001f && dy > 0.000001f) {
+                            const float t = (f - py[k - 1]) / dy;
+                            return cx[k - 1] + t * (cx[k] - cx[k - 1]);
+                          }
+                        }
+                        return f;
+                      };
+
+                      auto conceptual_a_fisico = [&](float c) -> float {
+                        if (c <= 0.0f) return 0.0f;
+                        if (c >= 1.0f) return 1.0f;
+
+                        for (int k = 1; k < puntos; k++) {
+                          const float dx = cx[k] - cx[k - 1];
+                          if (c <= cx[k] + 0.000001f && dx > 0.000001f) {
+                            const float t = (c - cx[k - 1]) / dx;
+                            return py[k - 1] + t * (py[k] - py[k - 1]);
+                          }
+                        }
+                        return c;
+                      };
+
+                      float destino = objetivo;
+                      if (destino < 0.0f) destino = 0.0f;
+                      if (destino > 1.0f) destino = 1.0f;
+
+                      const float c_actual =
+                        fisico_a_conceptual(id(p6_fisica));
+
+                      const float c_destino =
+                        destino <= 0.001f
+                        ? 0.0f
+                        : fisico_a_conceptual(destino);
+
+                      float delta = c_actual - c_destino;
+                      if (delta < 0.0f) delta = 0.0f;
+
+                      id(p6_sentido) = -1;
+                      id(p6_c_inicio) = c_actual;
+                      id(p6_c_destino) = c_destino;
+                      id(p6_fisica_destino) = destino;
+                      id(p6_duracion_ms) =
+                        static_cast<uint32_t>(
+                          delta *
+                          id(p6_tiempo_bajada).state *
+                          1000.0f
+                        );
+                      id(p6_inicio_ms) = millis();
+                      id(p6_moviendo) =
+                        id(p6_duracion_ms) >= 30;
+
+                      ESP_LOGI(
+                        "idrm_move",
+                        "P6 BAJADA F %.1f->%.1f C %.1f->%.1f tiempo=%u ms",
+                        id(p6_fisica) * 100.0f,
+                        destino * 100.0f,
+                        c_actual * 100.0f,
+                        c_destino * 100.0f,
+                        id(p6_duracion_ms)
+                      );
+
+                  - if:
+                      condition:
+                        lambda: |-
+                          return id(p6_moviendo);
+                      then:
+                        - cover.template.publish:
+                            id: persiana_6
+                            position: !lambda |-
+                              return id(p6_fisica);
+                            current_operation: CLOSING
+
+                        - script.execute:
+                            id: idrm_send_command
+                            channel: 64
+                            command: 135
+
+                        - delay: !lambda |-
+                            return id(p6_duracion_ms);
+
+                        - script.execute:
+                            id: idrm_send_command
+                            channel: 64
+                            command: 70
+
+                        - lambda: |-
+                            id(p6_fisica) = id(p6_fisica_destino);
+                            id(p6_moviendo) = false;
+
+                        - cover.template.publish:
+                            id: persiana_6
+                            position: !lambda |-
+                              return id(p6_fisica);
+                            current_operation: IDLE
+
+                      else:
+                        - lambda: |-
+                            id(p6_fisica) = objetivo;
+
+                        - cover.template.publish:
+                            id: persiana_6
+                            position: !lambda |-
+                              return id(p6_fisica);
+                            current_operation: IDLE
+
+                else:
+                  - cover.template.publish:
+                      id: persiana_6
+                      position: !lambda |-
+                        return id(p6_fisica);
+                      current_operation: IDLE
+
+
+# ============================================================
+# TIEMPOS
+# ============================================================
+
+number:
+
+  - platform: template
+    name: "${persiana_1_nombre} - Tiempo subida"
+    id: p1_tiempo_subida
+    min_value: 1
+    max_value: 60
+    step: 0.1
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true
+    initial_value: 17
+
+  - platform: template
+    name: "${persiana_1_nombre} - Tiempo bajada"
+    id: p1_tiempo_bajada
+    min_value: 1
+    max_value: 60
+    step: 0.1
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true
+    initial_value: 17
+
+  - platform: template
+    name: "${persiana_2_nombre} - Tiempo subida"
+    id: p2_tiempo_subida
+    min_value: 1
+    max_value: 60
+    step: 0.1
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true
+    initial_value: 19.5
+
+  - platform: template
+    name: "${persiana_2_nombre} - Tiempo bajada"
+    id: p2_tiempo_bajada
+    min_value: 1
+    max_value: 60
+    step: 0.1
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true
+    initial_value: 19.5
+
+  - platform: template
+    name: "${persiana_3_nombre} - Tiempo subida"
+    id: p3_tiempo_subida
+    min_value: 1
+    max_value: 60
+    step: 0.1
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true
+    initial_value: 16
+
+  - platform: template
+    name: "${persiana_3_nombre} - Tiempo bajada"
+    id: p3_tiempo_bajada
+    min_value: 1
+    max_value: 60
+    step: 0.1
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true
+    initial_value: 16
+
+  - platform: template
+    name: "${persiana_4_nombre} - Tiempo subida"
+    id: p4_tiempo_subida
+    min_value: 1
+    max_value: 60
+    step: 0.1
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true
+    initial_value: 25
+
+  - platform: template
+    name: "${persiana_4_nombre} - Tiempo bajada"
+    id: p4_tiempo_bajada
+    min_value: 1
+    max_value: 60
+    step: 0.1
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true
+    initial_value: 25
+
+  - platform: template
+    name: "${persiana_5_nombre} - Tiempo subida"
+    id: p5_tiempo_subida
+    min_value: 1
+    max_value: 60
+    step: 0.1
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true
+    initial_value: 14
+
+  - platform: template
+    name: "${persiana_5_nombre} - Tiempo bajada"
+    id: p5_tiempo_bajada
+    min_value: 1
+    max_value: 60
+    step: 0.1
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true
+    initial_value: 14
+
+  - platform: template
+    name: "${persiana_6_nombre} - Tiempo subida"
+    id: p6_tiempo_subida
+    min_value: 1
+    max_value: 60
+    step: 0.1
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true
+    initial_value: 26
+
+  - platform: template
+    name: "${persiana_6_nombre} - Tiempo bajada"
+    id: p6_tiempo_bajada
+    min_value: 1
+    max_value: 60
+    step: 0.1
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true
+    initial_value: 26
+
+# ============================================================
+# CURVAS DIRECCIONALES
+#
+# Formato:
+#   C:F|C:F|...
+#
+# 0:0 y 100:100 se añaden automáticamente.
+# ============================================================
+
+text:
+
+  - platform: template
+    name: "${persiana_1_nombre} - Curva Subida C:F"
+    id: p1_curva_subida
+    icon: "mdi:arrow-up-bold"
+    mode: text
+    min_length: 3
+    max_length: 120
+    optimistic: true
+    restore_value: true
+    initial_value: "25:25|50:70|70:90|80:100"
+
+  - platform: template
+    name: "${persiana_1_nombre} - Curva Bajada C:F"
+    id: p1_curva_bajada
+    icon: "mdi:arrow-down-bold"
+    mode: text
+    min_length: 3
+    max_length: 120
+    optimistic: true
+    restore_value: true
+    initial_value: "25:3|50:7|75:45|85:60|90:75"
+
+  - platform: template
+    name: "${persiana_2_nombre} - Curva Subida C:F"
+    id: p2_curva_subida
+    icon: "mdi:arrow-up-bold"
+    mode: text
+    min_length: 3
+    max_length: 120
+    optimistic: true
+    restore_value: true
+    initial_value: "25:25|50:70|70:90|80:100"
+
+  - platform: template
+    name: "${persiana_2_nombre} - Curva Bajada C:F"
+    id: p2_curva_bajada
+    icon: "mdi:arrow-down-bold"
+    mode: text
+    min_length: 3
+    max_length: 120
+    optimistic: true
+    restore_value: true
+    initial_value: "25:3|50:7|75:45|85:60|90:75"
+
+  - platform: template
+    name: "${persiana_3_nombre} - Curva Subida C:F"
+    id: p3_curva_subida
+    icon: "mdi:arrow-up-bold"
+    mode: text
+    min_length: 3
+    max_length: 120
+    optimistic: true
+    restore_value: true
+    initial_value: "25:25|50:70|70:90|80:100"
+
+  - platform: template
+    name: "${persiana_3_nombre} - Curva Bajada C:F"
+    id: p3_curva_bajada
+    icon: "mdi:arrow-down-bold"
+    mode: text
+    min_length: 3
+    max_length: 120
+    optimistic: true
+    restore_value: true
+    initial_value: "25:3|50:7|75:45|85:60|90:75"
+
+  - platform: template
+    name: "${persiana_4_nombre} - Curva Subida C:F"
+    id: p4_curva_subida
+    icon: "mdi:arrow-up-bold"
+    mode: text
+    min_length: 3
+    max_length: 120
+    optimistic: true
+    restore_value: true
+    initial_value: "25:25|50:70|70:90|80:100"
+
+  - platform: template
+    name: "${persiana_4_nombre} - Curva Bajada C:F"
+    id: p4_curva_bajada
+    icon: "mdi:arrow-down-bold"
+    mode: text
+    min_length: 3
+    max_length: 120
+    optimistic: true
+    restore_value: true
+    initial_value: "25:3|50:7|75:45|85:60|90:75"
+
+  - platform: template
+    name: "${persiana_5_nombre} - Curva Subida C:F"
+    id: p5_curva_subida
+    icon: "mdi:arrow-up-bold"
+    mode: text
+    min_length: 3
+    max_length: 120
+    optimistic: true
+    restore_value: true
+    initial_value: "25:25|50:70|70:90|80:100"
+
+  - platform: template
+    name: "${persiana_5_nombre} - Curva Bajada C:F"
+    id: p5_curva_bajada
+    icon: "mdi:arrow-down-bold"
+    mode: text
+    min_length: 3
+    max_length: 120
+    optimistic: true
+    restore_value: true
+    initial_value: "25:3|50:7|75:45|85:60|90:75"
+
+  - platform: template
+    name: "${persiana_6_nombre} - Curva Subida C:F"
+    id: p6_curva_subida
+    icon: "mdi:arrow-up-bold"
+    mode: text
+    min_length: 3
+    max_length: 120
+    optimistic: true
+    restore_value: true
+    initial_value: "25:25|50:70|70:90|80:100"
+
+  - platform: template
+    name: "${persiana_6_nombre} - Curva Bajada C:F"
+    id: p6_curva_bajada
+    icon: "mdi:arrow-down-bold"
+    mode: text
+    min_length: 3
+    max_length: 120
+    optimistic: true
+    restore_value: true
+    initial_value: "25:3|50:7|75:45|85:60|90:75"
+
+# ============================================================
+# ESTADO INTERNO
+# ============================================================
+
+globals:
+
+  # Posición física que Home Assistant conoce (0.0 - 1.0).
+  - id: p1_fisica
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+
+  # Estado de un movimiento temporizado en curso.
+  - id: p1_moviendo
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: p1_sentido
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: p1_inicio_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: p1_duracion_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: p1_c_inicio
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: p1_c_destino
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: p1_fisica_destino
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  # Posición física que Home Assistant conoce (0.0 - 1.0).
+  - id: p2_fisica
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+
+  # Estado de un movimiento temporizado en curso.
+  - id: p2_moviendo
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: p2_sentido
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: p2_inicio_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: p2_duracion_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: p2_c_inicio
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: p2_c_destino
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: p2_fisica_destino
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  # Posición física que Home Assistant conoce (0.0 - 1.0).
+  - id: p3_fisica
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+
+  # Estado de un movimiento temporizado en curso.
+  - id: p3_moviendo
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: p3_sentido
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: p3_inicio_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: p3_duracion_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: p3_c_inicio
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: p3_c_destino
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: p3_fisica_destino
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  # Posición física que Home Assistant conoce (0.0 - 1.0).
+  - id: p4_fisica
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+
+  # Estado de un movimiento temporizado en curso.
+  - id: p4_moviendo
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: p4_sentido
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: p4_inicio_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: p4_duracion_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: p4_c_inicio
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: p4_c_destino
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: p4_fisica_destino
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  # Posición física que Home Assistant conoce (0.0 - 1.0).
+  - id: p5_fisica
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+
+  # Estado de un movimiento temporizado en curso.
+  - id: p5_moviendo
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: p5_sentido
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: p5_inicio_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: p5_duracion_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: p5_c_inicio
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: p5_c_destino
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: p5_fisica_destino
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  # Posición física que Home Assistant conoce (0.0 - 1.0).
+  - id: p6_fisica
+    type: float
+    restore_value: yes
+    initial_value: '0.0'
+
+  # Estado de un movimiento temporizado en curso.
+  - id: p6_moviendo
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: p6_sentido
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: p6_inicio_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: p6_duracion_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: p6_c_inicio
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: p6_c_destino
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: p6_fisica_destino
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+# ============================================================
+# COVERS FÍSICOS
+# ============================================================
+
+cover:
+
+  - platform: template
+    name: "${persiana_1_nombre}"
+    id: persiana_1
+    device_class: shutter
+    has_position: true
+    assumed_state: true
+    optimistic: false
+
+    lambda: |-
+      return id(p1_fisica);
+
+    open_action:
+      - script.execute: p1_stop_actualiza
+      - script.wait: p1_stop_actualiza
+      - script.execute:
+          id: p1_mover
+          objetivo: 1.0
+
+    close_action:
+      - script.execute: p1_stop_actualiza
+      - script.wait: p1_stop_actualiza
+      - script.execute:
+          id: p1_mover
+          objetivo: 0.0
+
+    stop_action:
+      - script.execute: p1_stop_actualiza
+
+    position_action:
+      - script.execute: p1_stop_actualiza
+      - script.wait: p1_stop_actualiza
+      - script.execute:
+          id: p1_mover
+          objetivo: !lambda |-
+            return pos;
+
+  - platform: template
+    name: "${persiana_2_nombre}"
+    id: persiana_2
+    device_class: shutter
+    has_position: true
+    assumed_state: true
+    optimistic: false
+
+    lambda: |-
+      return id(p2_fisica);
+
+    open_action:
+      - script.execute: p2_stop_actualiza
+      - script.wait: p2_stop_actualiza
+      - script.execute:
+          id: p2_mover
+          objetivo: 1.0
+
+    close_action:
+      - script.execute: p2_stop_actualiza
+      - script.wait: p2_stop_actualiza
+      - script.execute:
+          id: p2_mover
+          objetivo: 0.0
+
+    stop_action:
+      - script.execute: p2_stop_actualiza
+
+    position_action:
+      - script.execute: p2_stop_actualiza
+      - script.wait: p2_stop_actualiza
+      - script.execute:
+          id: p2_mover
+          objetivo: !lambda |-
+            return pos;
+
+  - platform: template
+    name: "${persiana_3_nombre}"
+    id: persiana_3
+    device_class: shutter
+    has_position: true
+    assumed_state: true
+    optimistic: false
+
+    lambda: |-
+      return id(p3_fisica);
+
+    open_action:
+      - script.execute: p3_stop_actualiza
+      - script.wait: p3_stop_actualiza
+      - script.execute:
+          id: p3_mover
+          objetivo: 1.0
+
+    close_action:
+      - script.execute: p3_stop_actualiza
+      - script.wait: p3_stop_actualiza
+      - script.execute:
+          id: p3_mover
+          objetivo: 0.0
+
+    stop_action:
+      - script.execute: p3_stop_actualiza
+
+    position_action:
+      - script.execute: p3_stop_actualiza
+      - script.wait: p3_stop_actualiza
+      - script.execute:
+          id: p3_mover
+          objetivo: !lambda |-
+            return pos;
+
+  - platform: template
+    name: "${persiana_4_nombre}"
+    id: persiana_4
+    device_class: shutter
+    has_position: true
+    assumed_state: true
+    optimistic: false
+
+    lambda: |-
+      return id(p4_fisica);
+
+    open_action:
+      - script.execute: p4_stop_actualiza
+      - script.wait: p4_stop_actualiza
+      - script.execute:
+          id: p4_mover
+          objetivo: 1.0
+
+    close_action:
+      - script.execute: p4_stop_actualiza
+      - script.wait: p4_stop_actualiza
+      - script.execute:
+          id: p4_mover
+          objetivo: 0.0
+
+    stop_action:
+      - script.execute: p4_stop_actualiza
+
+    position_action:
+      - script.execute: p4_stop_actualiza
+      - script.wait: p4_stop_actualiza
+      - script.execute:
+          id: p4_mover
+          objetivo: !lambda |-
+            return pos;
+
+  - platform: template
+    name: "${persiana_5_nombre}"
+    id: persiana_5
+    device_class: shutter
+    has_position: true
+    assumed_state: true
+    optimistic: false
+
+    lambda: |-
+      return id(p5_fisica);
+
+    open_action:
+      - script.execute: p5_stop_actualiza
+      - script.wait: p5_stop_actualiza
+      - script.execute:
+          id: p5_mover
+          objetivo: 1.0
+
+    close_action:
+      - script.execute: p5_stop_actualiza
+      - script.wait: p5_stop_actualiza
+      - script.execute:
+          id: p5_mover
+          objetivo: 0.0
+
+    stop_action:
+      - script.execute: p5_stop_actualiza
+
+    position_action:
+      - script.execute: p5_stop_actualiza
+      - script.wait: p5_stop_actualiza
+      - script.execute:
+          id: p5_mover
+          objetivo: !lambda |-
+            return pos;
+
+  - platform: template
+    name: "${persiana_6_nombre}"
+    id: persiana_6
+    device_class: shutter
+    has_position: true
+    assumed_state: true
+    optimistic: false
+
+    lambda: |-
+      return id(p6_fisica);
+
+    open_action:
+      - script.execute: p6_stop_actualiza
+      - script.wait: p6_stop_actualiza
+      - script.execute:
+          id: p6_mover
+          objetivo: 1.0
+
+    close_action:
+      - script.execute: p6_stop_actualiza
+      - script.wait: p6_stop_actualiza
+      - script.execute:
+          id: p6_mover
+          objetivo: 0.0
+
+    stop_action:
+      - script.execute: p6_stop_actualiza
+
+    position_action:
+      - script.execute: p6_stop_actualiza
+      - script.wait: p6_stop_actualiza
+      - script.execute:
+          id: p6_mover
+          objetivo: !lambda |-
+            return pos;
+
+# ============================================================
+# NOTAS
+#
+# 1) Tras instalar por primera vez esta V8, lleva cada persiana
+#    una vez a 0 % o 100 % desde Home Assistant para fijar una
+#    referencia física conocida.
+#
+# 2) Si se usa el mando RF físico, Home Assistant no recibe
+#    feedback y la posición estimada puede desviarse.
+#
+# ============================================================
